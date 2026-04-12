@@ -43,6 +43,24 @@
 #define CRSF_FRAMETYPE_PARAMETER_WRITE   0x2D
 #define CRSF_FRAMETYPE_ELRS_STATUS       0x2E
 
+// Режим диагностики - игнорирование CRC для тестирования протокола
+#define TX_DIAGNOSTICS_MODE 1
+
+// Estructura для хранения пункта меню из menu.json
+struct MenuItem {
+    int id;
+    String name;
+    int type;           // 0-16 (uint8, int8, ..., command, etc)
+    int parent;         // parent folder id (0 = root)
+    bool isFolder;
+    bool isCommand;
+    String value;
+    String options;     // for select type: "opt1;opt2;opt3"
+    int minVal, maxVal; // for numeric types
+    String unit;
+    String description;
+};
+
 // Класс управления передатчиком (полудуплекс, открытый сток)
 class TransmitterController {
 public:
@@ -58,6 +76,7 @@ public:
     bool setValue(int fieldId, const String& value);
     bool executeCommand(int fieldId);
     void refresh();
+    void loadMenuFromJson(const char* jsonPath);
 
 private:
     struct CRSFField {
@@ -71,6 +90,8 @@ private:
     String _deviceName;
     bool _deviceInfoReceived, _fieldsRequested;
     std::map<uint8_t, CRSFField> _fields;
+    std::vector<MenuItem> _menuItems;
+    bool _menuFromFile;
 
     uint8_t _crc8(const uint8_t* d, size_t len);
     void _sendCrsfPacket(uint8_t* p, uint8_t len, uint8_t type);
@@ -134,8 +155,17 @@ void sendCrsfPacketToReceiver(uint8_t* payload, uint8_t len) {
 
 // Обработка данных от приёмника и ретрансляция
 void processReceiverData() {
+    static unsigned long lastDiag = 0;
     while(receiverSerial.available()) {
         uint8_t b = receiverSerial.read();
+        
+        // Грубая диагностика
+        if(millis() - lastDiag > 1000) {
+            Serial.print("RX2_RAW: ");
+            lastDiag = millis();
+        }
+        if(b == 0xC8) Serial.print("[SYNC] ");
+        
         if(!rxInPacket && b==0xC8) { rxInPacket=true; rxPacketIndex=0; rxExpectedLen=0; }
         if(rxInPacket) {
             if(rxPacketIndex < sizeof(rxPacketBuffer)) rxPacketBuffer[rxPacketIndex++] = b;
@@ -143,10 +173,24 @@ void processReceiverData() {
             if(rxPacketIndex==rxExpectedLen && rxExpectedLen>0) {
                 uint8_t calcCrc = crsfCrc8(rxPacketBuffer+2, rxPacketIndex-3);
                 uint8_t expCrc = rxPacketBuffer[rxPacketIndex-1];
+                
+                String hexDump = "RX2: len=" + String(rxPacketIndex) + " HEX: ";
+                for(uint8_t i = 0; i < rxPacketIndex; i++) {
+                    if(rxPacketBuffer[i] < 0x10) hexDump += "0";
+                    hexDump += String(rxPacketBuffer[i], HEX);
+                    hexDump += " ";
+                }
+                hexDump += "crc_calc=0x" + String(calcCrc, HEX) + " exp=0x" + String(expCrc, HEX) + " ";
+                hexDump += (calcCrc==expCrc) ? "OK" : "BAD";
+                Serial.println(hexDump);
+                
                 if(calcCrc == expCrc) {
                     lastPacketTime = millis();
                     packetCount++;
                     txController.sendRawPacket(rxPacketBuffer+4, rxPacketIndex-5, rxPacketBuffer[3]);
+                } else {
+                    // Даже если CRC плохая, обновляем таймаут для диагностики
+                    lastPacketTime = millis();
                 }
                 rxInPacket=false;
             } else if(rxPacketIndex>64) rxInPacket=false;
@@ -162,13 +206,11 @@ void updateRelay() {
 
 void loadSettings() {
     prefs.begin("elrs", false);
-    currentBaudRate = prefs.getInt("baud", DEFAULT_BAUD);
     currentPowerMode = prefs.getInt("pmode", POWER_MODE_AUTO);
     wifiSSID = prefs.getString("wifi_ssid", "");
     wifiPass = prefs.getString("wifi_pass", "");
     prefs.end();
 }
-void saveBaudRate(int b) { prefs.begin("elrs", false); prefs.putInt("baud", b); prefs.end(); delay(50); currentBaudRate=b; }
 void savePowerMode(int m) { prefs.begin("elrs", false); prefs.putInt("pmode", m); prefs.end(); delay(50); currentPowerMode=m; }
 void saveWiFiSettings(const String& ssid, const String& pass) {
     prefs.begin("elrs", false);
@@ -255,7 +297,6 @@ async function refreshDisplay(){
 async function fullUpdate(){
     await refreshDisplay();
     let r=await fetch('/api/status'), d=await r.json();
-    document.getElementById('newBaud').value = d.baudrate;
     let p=await fetch('/api/powerMode'), pd=await p.json();
     document.getElementById('modeAuto').checked = (pd.mode==0);
     document.getElementById('modeAlwaysOn').checked = (pd.mode==1);
@@ -266,10 +307,6 @@ async function applyPower(){
     let m=document.getElementById('modeAuto').checked?0:(document.getElementById('modeAlwaysOn').checked?1:2);
     await fetch('/api/setPowerMode?mode='+m);
     fullUpdate();
-}
-async function setBaud(){
-    let b=document.getElementById('newBaud').value;
-    await fetch('/api/setBaud?baud='+b); alert('Restarting...'); setTimeout(()=>location.reload(),2000);
 }
 async function bindRx(){ if(confirm('Bind receiver?')) await fetch('/api/bindRx'); }
 async function resetRx(){ if(confirm('Reset bind?')) await fetch('/api/resetRxBind'); }
@@ -286,17 +323,26 @@ function switchTab(id){
 }
 
 async function loadTxMenu(parent){
-    let r=await fetch('/api/tx/menu?parent='+parent), m=await r.json();
-    curParent=parent;
-    let html=parent!==0?'<button class="secondary" onclick="loadTxMenu(0)">← Назад</button>':'';
-    html+='<ul class="menu-tree">';
-    m.items.forEach(i=>{
-        if(i.type==='folder') html+=`<li class="menu-item menu-folder" onclick="loadTxMenu(${i.id})">📁 ${i.name}</li>`;
-        else if(i.type==='command') html+=`<li class="menu-item" onclick="execCmd(${i.id})">⚡ ${i.name}</li>`;
-        else html+=`<li class="menu-item" onclick="editField(${i.id},'${i.name}','${i.value}')">${i.name} <span class="menu-value">${i.value}</span></li>`;
-    });
-    html+='</ul><hr><button class="secondary" onclick="loadTxMenu(curParent)">Refresh</button>';
-    document.getElementById('tx-menu').innerHTML=html;
+    try {
+        let r = await fetch('/api/tx/menu?parent='+parent);
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        let m = await r.json();
+        curParent = parent;
+        let html = parent!==0?'<button class="secondary" onclick="loadTxMenu(0)">← Назад</button>':'';
+        html += '<ul class="menu-tree">';
+        (m.items || []).forEach(i=>{
+            const name = String(i.name || '');
+            const value = String(i.value || '');
+            if(i.type==='folder') html+=`<li class="menu-item menu-folder" onclick="loadTxMenu(${i.id})">📁 ${name}</li>`;
+            else if(i.type==='command') html+=`<li class="menu-item" onclick="execCmd(${i.id})">⚡ ${name}</li>`;
+            else html+=`<li class="menu-item" onclick="editField(${i.id},'${name.replace(/'/g,"\\'")}','${value.replace(/'/g,"\\'")}')">${name} <span class="menu-value">${value}</span></li>`;
+        });
+        html += '</ul><hr><button class="secondary" onclick="loadTxMenu(curParent)">Refresh</button>';
+        document.getElementById('tx-menu').innerHTML=html;
+    } catch(e) {
+        document.getElementById('tx-menu').innerHTML = '<div style="color:#f66">Error loading TX menu: '+e.message+'</div>';
+        console.error(e);
+    }
 }
 function execCmd(id){ if(confirm('Execute?')) fetch('/api/tx/command?id='+id).then(()=>loadTxMenu(curParent)); }
 function editField(id,name,val){
@@ -348,11 +394,15 @@ window.onload=()=>{ fullUpdate(); };
         <tr><th>Selected Mode</th><td id="powerModeText">---</td></tr></table>
     </div>
     <div class="card"><h3>System</h3>
-        <div class="flex"><input id="newBaud" value="460800"> <button onclick="setBaud()">Set Baud & Restart</button></div>
     </div>
 </div>
 <div id="tab-transmitter" class="tab-content">
     <div class="card"><h3>TX Settings</h3><div id="tx-menu">Loading...</div></div>
+    <div class="card"><h3>Lua / Custom TX UI</h3>
+        <button onclick="window.location.href='/tx_interface.html'">Open Lua Interface</button>
+        <button class="secondary" onclick="window.location.href='/lua'">Open Lua Alias</button>
+        <p style="margin-top:10px;color:#bbb;font-size:0.9em">If a custom tx_interface.html exists on SD:/www, it will be loaded here.</p>
+    </div>
 </div>
 <div id="tab-receiver" class="tab-content">
     <div class="card"><h3>Receiver</h3>
@@ -378,7 +428,7 @@ window.onload=()=>{ fullUpdate(); };
 
 // API
 void handleApiStatus() {
-    JsonDocument d;
+    DynamicJsonDocument d(256);
     d["linkRadio"] = linkToRadio;
     d["linkCopter"] = txController.isConnected();
     d["packets"] = packetCount;
@@ -389,13 +439,11 @@ void handleApiStatus() {
     d["sd"] = sdStatusMsg;
     String s; serializeJson(d, s); server.send(200, "application/json", s);
 }
-void handleApiSetBaud() {
-    if(server.hasArg("baud")){ int b=server.arg("baud").toInt(); if(b>=9600&&b<=921600){ saveBaudRate(b); server.send(200); delay(200); ESP.restart(); }}
-    server.send(400);
-}
 void handleApiPowerMode() {
-    JsonDocument d; d["mode"]=currentPowerMode; d["relayState"]=digitalRead(RELAY_PIN);
-    String s; serializeJson(d,s); server.send(200,"application/json",s);
+    DynamicJsonDocument d(128);
+    d["mode"] = currentPowerMode;
+    d["relayState"] = digitalRead(RELAY_PIN);
+    String s; serializeJson(d, s); server.send(200, "application/json", s);
 }
 void handleApiSetPowerMode() {
     if(server.hasArg("mode")){ int m=server.arg("mode").toInt(); if(m>=0&&m<=2){ savePowerMode(m); server.send(200); return; }}
@@ -427,14 +475,33 @@ void handleApiTxCommand() {
 void handleTxInterface() {
     if(!streamFileFromPriority("/www/tx_interface.html","text/html")) {
         String html = R"rawliteral(<html><body style="background:#111;color:#eee;font-family:Segoe UI"><div id="tx">Default. Put tx_interface.html on SD:/www/</div><script>
-async function load(p=0){let r=await fetch('/api/tx/menu?parent='+p),m=await r.json();let h='';if(p)h+='<button onclick="load(0)">Back</button>';h+='<ul>';m.items.forEach(i=>{if(i.type=='folder')h+='<li onclick="load('+i.id+')">📁'+i.name;else if(i.type=='command')h+='<li onclick="fetch(\'/api/tx/command?id='+i.id+'\')">⚡'+i.name;else h+='<li onclick="edit('+i.id+',\''+i.name+'\',\''+i.value+'\')">'+i.name+' <span>'+i.value+'</span>';});h+='</ul>';document.getElementById('tx').innerHTML=h;}
+async function load(p=0){
+    try {
+        let r = await fetch('/api/tx/menu?parent='+p);
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        let m = await r.json();
+        let h = '';
+        if(p) h += '<button onclick="load(0)">Back</button>';
+        h += '<ul>';
+        m.items.forEach(i => {
+            if(i.type == 'folder') h += '<li onclick="load('+i.id+')">📁'+i.name+'</li>';
+            else if(i.type == 'command') h += '<li onclick="fetch(\'/api/tx/command?id='+i.id+'\')">⚡'+i.name+'</li>';
+            else h += '<li onclick="edit('+i.id+',\''+i.name+'\',\''+i.value+'\')">'+i.name+' <span>'+i.value+'</span></li>';
+        });
+        h += '</ul>';
+        document.getElementById('tx').innerHTML = h;
+    } catch(e) {
+        document.getElementById('tx').innerHTML = '<div style="color:#f66">Error loading TX menu: '+e.message+'</div>';
+        console.error(e);
+    }
+}
 function edit(i,n,v){let nv=prompt(n,v);if(nv)fetch('/api/tx/set?id='+i+'&value='+nv).then(()=>load(curParent));}
 let curParent=0;load(0);</script></body></html>)rawliteral";
         server.send(200,"text/html",html);
     }
 }
 void handleApiWiFiGet() {
-    JsonDocument d;
+    DynamicJsonDocument d(256);
     d["ssid"] = wifiSSID;
     d["connected"] = (WiFi.status() == WL_CONNECTED);
     d["ip"] = WiFi.localIP().toString();
@@ -452,7 +519,6 @@ void handleApiWiFiPost() {
 void setupWebServer() {
     server.on("/", handleRoot);
     server.on("/api/status", handleApiStatus);
-    server.on("/api/setBaud", handleApiSetBaud);
     server.on("/api/powerMode", handleApiPowerMode);
     server.on("/api/setPowerMode", handleApiSetPowerMode);
     server.on("/api/bindRx", handleApiBindRx);
@@ -462,6 +528,7 @@ void setupWebServer() {
     server.on("/api/tx/set", handleApiTxSet);
     server.on("/api/tx/command", handleApiTxCommand);
     server.on("/tx_interface.html", handleTxInterface);
+    server.on("/lua", handleTxInterface);
     server.on("/api/wifi", HTTP_GET, handleApiWiFiGet);
     server.on("/api/wifi", HTTP_POST, handleApiWiFiPost);
     server.onNotFound([]() {
@@ -487,6 +554,7 @@ void setup() {
     else Serial.println("LittleFS mounted");
     
     loadSettings();
+    currentBaudRate = DEFAULT_BAUD;
     Serial.printf("Settings: baud=%d, powerMode=%d, WiFi SSID=%s\n", currentBaudRate, currentPowerMode, wifiSSID.c_str());
     
     pinMode(RELAY_PIN, OUTPUT);
@@ -547,19 +615,15 @@ TransmitterController::TransmitterController() :
 void TransmitterController::begin(unsigned long baud) {
     // Настраиваем пин как открытый сток
     pinMode(TX_PIN, OUTPUT_OPEN_DRAIN);
-    digitalWrite(TX_PIN, HIGH);  // Высокоимпедансное состояние для приёма
+    digitalWrite(TX_PIN, HIGH);
 
     // Инициализация UART с одним пином для RX и TX
     _serial = &Serial1;
     _serial->begin(baud, SERIAL_8N1, TX_PIN, TX_PIN);
 
-    // Включаем инверсию данных (требуется для CRSF)
-    uart_set_line_inverse(UART_NUM_1, UART_SIGNAL_RXD_INV | UART_SIGNAL_TXD_INV);
+    //uart_set_line_inverse(UART_NUM_1, UART_SIGNAL_RXD_INV | UART_SIGNAL_TXD_INV);
 
-    // Включаем полудуплексный режим RS485 (автоматическое управление направлением)
-    uart_set_mode(UART_NUM_1, UART_MODE_RS485_HALF_DUPLEX);
-
-    Serial.printf("TX UART (half-duplex open-drain) started on pin %d\n", TX_PIN);
+    Serial.printf("TX UART started on pin %d, baud=%lu\n", TX_PIN, baud);
     delay(100);
     _sendDevicePing();
     _lastResponseTime = millis();
@@ -590,7 +654,7 @@ void TransmitterController::_sendCrsfPacket(uint8_t* payload, uint8_t len, uint8
     packet[idx] = _crc8(packet + 2, idx - 2);
     idx++;
 
-    // Отправляем без ручного управления пином — всё делает RS485
+    Serial.printf("TX1: Sending pkt len=%u type=0x%02X crc=0x%02X\n", idx, packetType, packet[idx-1]);
     _serial->write(packet, idx);
     _serial->flush();
 }
@@ -613,6 +677,7 @@ void TransmitterController::sendRawPacket(uint8_t* payload, uint8_t len, uint8_t
 }
 
 void TransmitterController::_sendDevicePing() {
+    Serial.println("TX1: Sending DEVICE_PING...");
     uint8_t p[] = {0x00, 0x00};
     _sendCrsfPacket(p, 2, CRSF_FRAMETYPE_DEVICE_PING);
 }
@@ -645,24 +710,64 @@ void TransmitterController::_processIncoming() {
     static uint8_t expLen=0;
     while (_serial->available()) {
         uint8_t b = _serial->read();
-        if (!inPacket && b == 0xC8) { inPacket=true; idx=0; expLen=0; }
+        if (!inPacket && b == 0xC8) { 
+            inPacket=true; 
+            idx=0; 
+            expLen=0; 
+        }
         if (inPacket) {
             if (idx < sizeof(buf)) buf[idx++] = b;
             if (idx == 2) expLen = buf[1] + 2;
             if (idx == expLen && expLen>0) {
-                bool crcOk = (_crc8(buf+2, idx-3) == buf[idx-1]);
-                Serial.printf("TX1: packet len=%u exp=%u type=0x%02X crc=%s\n", idx, expLen, buf[3], crcOk?"OK":"BAD");
-                if (crcOk) {
+                uint8_t calcCrc = _crc8(buf+2, idx-3);  // CRC from FROM byte through payload
+                uint8_t expCrc = buf[idx-1];
+                uint8_t frameType = buf[4];
+                
+                // Отладка: вывод всех пакетов с CRC информацией
+                String hexDump = "HEX: ";
+                for(uint8_t i = 0; i < idx; i++) {
+                    if(buf[i] < 0x10) hexDump += "0";
+                    hexDump += String(buf[i], HEX);
+                    hexDump += " ";
+                }
+                
+                Serial.printf("TX1: RX len=%u type=0x%02X from=0x%02X to=0x%02X crc_calc=0x%02X exp=0x%02X %s\n", 
+                    idx, frameType, buf[2], buf[3], calcCrc, expCrc, calcCrc==expCrc?"OK":"BAD");
+                Serial.println(hexDump);
+                
+                bool crcOk = (calcCrc == expCrc);
+                bool processPkt = crcOk;
+                #if TX_DIAGNOSTICS_MODE
+                    if (!crcOk) {
+                        Serial.println("TX1: CRC_IGNORE_DIAGNOSTIC");
+                    }
+                #endif
+
+                if (processPkt) {
                     _lastResponseTime = millis();
                     _connected = true;
-                    switch(buf[3]) {
-                        case CRSF_FRAMETYPE_DEVICE_INFO: _handleDeviceInfo(buf+4, idx-5); break;
-                        case CRSF_FRAMETYPE_PARAMETER_DATA: _handleParameterData(buf+4, idx-5); break;
-                        case CRSF_FRAMETYPE_ELRS_STATUS: _handleElrsStatus(buf+4, idx-5); break;
+                    switch(frameType) {
+                        case CRSF_FRAMETYPE_DEVICE_INFO: 
+                            Serial.println("TX1: Got DEVICE_INFO");
+                            _handleDeviceInfo(buf+5, idx-6); 
+                            break;
+                        case CRSF_FRAMETYPE_PARAMETER_DATA: 
+                            _handleParameterData(buf+5, idx-6); 
+                            break;
+                        case CRSF_FRAMETYPE_ELRS_STATUS: 
+                            _handleElrsStatus(buf+5, idx-6); 
+                            break;
+                        default:
+                            break;
                     }
+                } else {
+                    Serial.println("TX1: CRC mismatch!");
                 }
                 inPacket = false;
-            } else if (idx > 64) inPacket = false;
+            } else if (idx > 64) {
+                Serial.printf("TX1: packet too long (%u), resync\n", idx);
+                inPacket = false;
+            }
         }
     }
 }
@@ -708,12 +813,23 @@ void TransmitterController::_handleElrsStatus(uint8_t* data, uint8_t len) {}
 
 void TransmitterController::update() {
     _processIncoming();
-    if (millis() - _lastResponseTime > 2000) _connected = false;
+    if (millis() - _lastResponseTime > 2000) {
+        if (_connected) {
+            _connected = false;
+            Serial.println("TX1: Connection timeout!");
+        }
+    }
     static unsigned long lastPing = 0;
-    if (millis() - lastPing > 5000) {
+    if (millis() - lastPing > 3000) {
         lastPing = millis();
-        if (!_connected) _sendDevicePing();
-        else if (_deviceInfoReceived && !_fieldsRequested) _requestAllFields();
+        if (!_connected) {
+            Serial.printf("TX1: Not connected, pinging... (_serial=%p, available=%d)\n", _serial, _serial->available());
+            _sendDevicePing();
+        }
+        else if (_deviceInfoReceived && !_fieldsRequested) {
+            Serial.println("TX1: Requesting all fields...");
+            _requestAllFields();
+        }
     }
 }
 
@@ -749,8 +865,8 @@ void TransmitterController::_buildMenuItems(JsonArray items, int parentId) {
 }
 
 String TransmitterController::getMenuJson(int parentId) {
-    JsonDocument doc;
-    JsonArray items = doc["items"].to<JsonArray>();
+    DynamicJsonDocument doc(2048);
+    JsonArray items = doc.createNestedArray("items");
     doc["parent"] = parentId;
     _buildMenuItems(items, parentId);
     String out; serializeJson(doc, out); return out;

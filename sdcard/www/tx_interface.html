@@ -20,28 +20,39 @@
     let currentParent = 0;
     let menuStack = [];
 
+    function escapeForJsString(value) {
+        return String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+    }
+
     async function loadMenu(parentId) {
-        const res = await fetch('/api/tx/menu?parent=' + parentId);
-        const menu = await res.json();
-        currentParent = parentId;
-        let html = '';
-        if (parentId !== 0) {
-            html += `<button class="back-btn" onclick="goBack()">← Назад</button>`;
-        }
-        html += '<ul class="menu-tree">';
-        menu.items.forEach(item => {
-            if (item.type === 'folder') {
-                html += `<li class="menu-item menu-folder" onclick="menuStack.push(${currentParent}); loadMenu(${item.id})">📁 ${item.name}</li>`;
-            } else if (item.type === 'command') {
-                html += `<li class="menu-item" onclick="executeCommand(${item.id})">⚡ ${item.name}</li>`;
-            } else {
-                html += `<li class="menu-item" onclick="editField(${item.id}, '${item.name}', '${item.value}', '${item.type}', '${item.options || ''}')">
-                    ${item.name} <span class="menu-value">${item.value}</span>
-                </li>`;
+        try {
+            const res = await fetch('/api/tx/menu?parent=' + parentId);
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const menu = await res.json();
+            currentParent = parentId;
+            let html = '';
+            if (parentId !== 0) {
+                html += `<button class="back-btn" onclick="goBack()">← Назад</button>`;
             }
-        });
-        html += '</ul><hr><button onclick="loadMenu(currentParent)">Refresh</button>';
-        document.getElementById('tx-menu-container').innerHTML = html;
+            html += '<ul class="menu-tree">';
+            (menu.items || []).forEach(item => {
+                const name = escapeForJsString(item.name || '');
+                const value = escapeForJsString(item.value || '');
+                const options = escapeForJsString(item.options || '');
+                if (item.type === 'folder') {
+                    html += `<li class="menu-item menu-folder" onclick="menuStack.push(${currentParent}); loadMenu(${item.id})">📁 ${item.name}</li>`;
+                } else if (item.type === 'command') {
+                    html += `<li class="menu-item" onclick="executeCommand(${item.id})">⚡ ${item.name}</li>`;
+                } else {
+                    html += `<li class="menu-item" onclick="editField(${item.id}, '${name}', '${value}', '${item.type}', '${options}')">${item.name} <span class="menu-value">${item.value}</span></li>`;
+                }
+            });
+            html += '</ul><hr><button onclick="loadMenu(currentParent)">Refresh</button>';
+            document.getElementById('tx-menu-container').innerHTML = html;
+        } catch (e) {
+            document.getElementById('tx-menu-container').innerHTML = '<div style="color:#f66">Error loading TX menu: ' + e.message + '</div>';
+            console.error(e);
+        }
     }
 
     function goBack() {
