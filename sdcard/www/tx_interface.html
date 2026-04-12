@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>TX Menu</title>
+    <style>
+        body { background: #11161f; color: #e0e0e0; font-family: 'Segoe UI', Arial; padding: 15px; }
+        .menu-tree { list-style: none; padding: 0; }
+        .menu-item { padding: 12px; border-bottom: 1px solid #2a3040; cursor: pointer; }
+        .menu-folder { font-weight: bold; }
+        .menu-value { float: right; color: #e94560; }
+        .back-btn { margin-bottom: 15px; background: #2a3040; border: none; color: white; padding: 8px 16px; border-radius: 6px; cursor: pointer; }
+        button { background: #e94560; border: none; padding: 10px 20px; border-radius: 8px; color: white; cursor: pointer; }
+    </style>
+</head>
+<body>
+<div id="tx-menu-container">Loading...</div>
+<script>
+    let currentParent = 0;
+    let menuStack = [];
+
+    async function loadMenu(parentId) {
+        const res = await fetch('/api/tx/menu?parent=' + parentId);
+        const menu = await res.json();
+        currentParent = parentId;
+        let html = '';
+        if (parentId !== 0) {
+            html += `<button class="back-btn" onclick="goBack()">← Назад</button>`;
+        }
+        html += '<ul class="menu-tree">';
+        menu.items.forEach(item => {
+            if (item.type === 'folder') {
+                html += `<li class="menu-item menu-folder" onclick="menuStack.push(${currentParent}); loadMenu(${item.id})">📁 ${item.name}</li>`;
+            } else if (item.type === 'command') {
+                html += `<li class="menu-item" onclick="executeCommand(${item.id})">⚡ ${item.name}</li>`;
+            } else {
+                html += `<li class="menu-item" onclick="editField(${item.id}, '${item.name}', '${item.value}', '${item.type}', '${item.options || ''}')">
+                    ${item.name} <span class="menu-value">${item.value}</span>
+                </li>`;
+            }
+        });
+        html += '</ul><hr><button onclick="loadMenu(currentParent)">Refresh</button>';
+        document.getElementById('tx-menu-container').innerHTML = html;
+    }
+
+    function goBack() {
+        if (menuStack.length > 0) {
+            const prev = menuStack.pop();
+            loadMenu(prev);
+        } else {
+            loadMenu(0);
+        }
+    }
+
+    async function executeCommand(id) {
+        if (confirm('Execute command?')) {
+            await fetch('/api/tx/command?id=' + id);
+            loadMenu(currentParent);
+        }
+    }
+
+    function editField(id, name, currentValue, type, options) {
+        let newValue;
+        if (type === 'select' && options) {
+            // Здесь можно сделать выпадающий список
+            newValue = prompt('Enter value (options: ' + options + ')', currentValue);
+        } else {
+            newValue = prompt('Enter new value for ' + name, currentValue);
+        }
+        if (newValue !== null) {
+            fetch('/api/tx/set?id=' + id + '&value=' + encodeURIComponent(newValue))
+                .then(() => loadMenu(currentParent));
+        }
+    }
+
+    loadMenu(0);
+</script>
+</body>
+</html>

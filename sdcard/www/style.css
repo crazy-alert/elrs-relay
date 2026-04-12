@@ -1,0 +1,224 @@
+/* style.css - ELRS Repeater Pro Theme */
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: 'Segoe UI', 'Roboto', Arial, sans-serif;
+    margin: 0;
+    padding: 20px;
+    background: #0a0e1a;
+    color: #e0e0e0;
+}
+
+.container {
+    max-width: 900px;
+    margin: 0 auto;
+}
+
+h1 {
+    color: #e94560;
+    text-align: center;
+    margin-bottom: 25px;
+    font-weight: 400;
+    letter-spacing: 1px;
+}
+
+/* Вкладки */
+.tabs {
+    display: flex;
+    gap: 5px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+}
+
+.tab-btn {
+    padding: 12px 24px;
+    background: #1a1f2e;
+    border: none;
+    border-radius: 8px 8px 0 0;
+    color: #aaa;
+    cursor: pointer;
+    font-size: 16px;
+    transition: all 0.2s;
+}
+
+.tab-btn:hover {
+    background: #252c3e;
+    color: #fff;
+}
+
+.tab-btn.active {
+    background: #e94560;
+    color: #fff;
+}
+
+/* Контент вкладок */
+.tab-content {
+    display: none;
+    background: #11161f;
+    border-radius: 0 12px 12px 12px;
+    padding: 20px;
+}
+
+.tab-content.active {
+    display: block;
+}
+
+/* Карточки */
+.card {
+    background: #1a1f2e;
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 20px;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+}
+
+.card h3 {
+    margin-top: 0;
+    margin-bottom: 15px;
+    color: #e94560;
+    border-bottom: 1px solid #2a3040;
+    padding-bottom: 10px;
+    font-weight: 400;
+}
+
+/* Таблицы */
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+td, th {
+    padding: 12px;
+    border-bottom: 1px solid #2a3040;
+    text-align: left;
+}
+
+th {
+    color: #e94560;
+    width: 40%;
+    font-weight: 400;
+}
+
+/* Кнопки */
+button, .button {
+    background: #e94560;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 8px;
+    color: #fff;
+    cursor: pointer;
+    font-size: 14px;
+    transition: background 0.2s;
+}
+
+button:hover, .button:hover {
+    background: #c0314a;
+}
+
+button.danger {
+    background: #dc3545;
+}
+
+button.danger:hover {
+    background: #b02a37;
+}
+
+button.secondary {
+    background: #2a3040;
+}
+
+button.secondary:hover {
+    background: #3a4255;
+}
+
+/* Формы */
+select, input[type="text"], input[type="number"] {
+    background: #2a3040;
+    border: none;
+    padding: 10px;
+    border-radius: 6px;
+    color: #fff;
+    font-size: 14px;
+}
+
+input:focus, select:focus {
+    outline: 2px solid #e94560;
+}
+
+/* Утилиты */
+.status-ok {
+    color: #2ecc71;
+    font-weight: 500;
+}
+
+.status-bad {
+    color: #e74c3c;
+    font-weight: 500;
+}
+
+.flex {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+.info-text {
+    font-size: 12px;
+    color: #888;
+    margin-top: 8px;
+}
+
+hr {
+    margin: 20px 0;
+    border: none;
+    border-top: 1px solid #2a3040;
+}
+
+/* Меню передатчика */
+.menu-tree {
+    list-style: none;
+    padding-left: 0;
+}
+
+.menu-item {
+    padding: 12px;
+    border-bottom: 1px solid #2a3040;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+
+.menu-item:hover {
+    background: #2a3040;
+}
+
+.menu-folder {
+    font-weight: bold;
+}
+
+.menu-value {
+    float: right;
+    color: #e94560;
+}
+
+.back-btn {
+    margin-bottom: 15px;
+    background: #2a3040;
+    border: none;
+    color: white;
+    padding: 8px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+/* Адаптивность */
+@media (max-width: 600px) {
+    body { padding: 10px; }
+    .tab-btn { padding: 8px 16px; font-size: 14px; }
+    .flex { flex-direction: column; align-items: stretch; }
+    button { width: 100%; }
+}
