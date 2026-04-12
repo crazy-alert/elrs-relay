@@ -1,6 +1,6 @@
 /*
   ==============================================================================
-   ELRS РЕТРАНСЛЯТОР PRO (полудуплекс без транзистора, единый пин)
+   ELRS РЕТРАНСЛЯТОР
   ==============================================================================
 */
 
@@ -13,6 +13,8 @@
 #include <LittleFS.h>
 #include <FS.h>
 #include <SD.h>
+#include <driver/uart.h>    // для uart_set_line_inverse и uart_set_mode
+#include <DNSServer.h>
 #include <map>
 #include <vector>
 
@@ -87,6 +89,9 @@ private:
 // Глобальные объекты
 Preferences prefs;
 WebServer server(80);
+DNSServer dnsServer;
+IPAddress apIP(192,168,4,1);
+const byte DNS_PORT = 53;
 HardwareSerial receiverSerial(2);
 TransmitterController txController;
 
@@ -112,7 +117,7 @@ uint8_t crsfCrc8(const uint8_t* data, size_t len) {
     uint8_t crc = 0;
     for (size_t i = 0; i < len; i++) {
         crc ^= data[i];
-        for (uint8_t b = 0; b < 8; b++) crc = (crc & 0x80) ? (crc << 1) ^ 0x31 : (crc << 1);
+        for (uint8_t b = 0; b < 8; b++) crc = (crc & 0x80) ? (crc << 1) ^ 0xD5 : (crc << 1);
     }
     return crc;
 }
@@ -136,7 +141,9 @@ void processReceiverData() {
             if(rxPacketIndex < sizeof(rxPacketBuffer)) rxPacketBuffer[rxPacketIndex++] = b;
             if(rxPacketIndex==2) rxExpectedLen = rxPacketBuffer[1]+2;
             if(rxPacketIndex==rxExpectedLen && rxExpectedLen>0) {
-                if(crsfCrc8(rxPacketBuffer+2, rxPacketIndex-3) == rxPacketBuffer[rxPacketIndex-1]) {
+                uint8_t calcCrc = crsfCrc8(rxPacketBuffer+2, rxPacketIndex-3);
+                uint8_t expCrc = rxPacketBuffer[rxPacketIndex-1];
+                if(calcCrc == expCrc) {
                     lastPacketTime = millis();
                     packetCount++;
                     txController.sendRawPacket(rxPacketBuffer+4, rxPacketIndex-5, rxPacketBuffer[3]);
@@ -457,6 +464,10 @@ void setupWebServer() {
     server.on("/tx_interface.html", handleTxInterface);
     server.on("/api/wifi", HTTP_GET, handleApiWiFiGet);
     server.on("/api/wifi", HTTP_POST, handleApiWiFiPost);
+    server.onNotFound([]() {
+        server.sendHeader("Location", String("http://") + apIP.toString(), true);
+        server.send(302, "text/plain", "Redirecting");
+    });
     server.begin();
     Serial.println("Web server started");
 }
@@ -482,6 +493,7 @@ void setup() {
     digitalWrite(RELAY_PIN, LOW);
     
     receiverSerial.begin(currentBaudRate, SERIAL_8N1, 16, 17);
+    uart_set_line_inverse(UART_NUM_2, UART_SIGNAL_RXD_INV | UART_SIGNAL_TXD_INV);
     txController.begin(currentBaudRate);
     
     sdCardAvailable = initSDCard();
@@ -496,8 +508,9 @@ void setup() {
         if (WiFi.status() == WL_CONNECTED) Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
         else Serial.println("\nFailed to connect.");
     }
-    WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
+    WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
     WiFi.softAP("ELRS_Repeater_Pro", "12345678", 1, 0);
+    dnsServer.start(DNS_PORT, "*", apIP);
     Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
     
     setupWebServer();
@@ -520,6 +533,7 @@ void loop() {
         digitalWrite(LED_PIN, HIGH);
         lastLedBlink = millis();
     }
+    dnsServer.processNextRequest();
     server.handleClient();
     esp_task_wdt_reset();
     yield();
@@ -539,13 +553,11 @@ void TransmitterController::begin(unsigned long baud) {
     _serial = &Serial1;
     _serial->begin(baud, SERIAL_8N1, TX_PIN, TX_PIN);
 
-    // Включаем инверсию данных (если нужно для CRSF)
-    UART1.conf0.rx_inv = 1;
-    UART1.conf0.tx_inv = 1;
+    // Включаем инверсию данных (требуется для CRSF)
+    uart_set_line_inverse(UART_NUM_1, UART_SIGNAL_RXD_INV | UART_SIGNAL_TXD_INV);
 
     // Включаем полудуплексный режим RS485 (автоматическое управление направлением)
-    UART1.rs485_conf.en = 1;
-    UART1.rs485_conf.tx_rx_en = 1;
+    uart_set_mode(UART_NUM_1, UART_MODE_RS485_HALF_DUPLEX);
 
     Serial.printf("TX UART (half-duplex open-drain) started on pin %d\n", TX_PIN);
     delay(100);
@@ -558,7 +570,7 @@ uint8_t TransmitterController::_crc8(const uint8_t* data, size_t len) {
     for (size_t i = 0; i < len; i++) {
         crc ^= data[i];
         for (uint8_t bit = 0; bit < 8; bit++) {
-            if (crc & 0x80) crc = (crc << 1) ^ 0x31;
+            if (crc & 0x80) crc = (crc << 1) ^ 0xD5;
             else crc = (crc << 1);
         }
     }
@@ -638,7 +650,9 @@ void TransmitterController::_processIncoming() {
             if (idx < sizeof(buf)) buf[idx++] = b;
             if (idx == 2) expLen = buf[1] + 2;
             if (idx == expLen && expLen>0) {
-                if (_crc8(buf+2, idx-3) == buf[idx-1]) {
+                bool crcOk = (_crc8(buf+2, idx-3) == buf[idx-1]);
+                Serial.printf("TX1: packet len=%u exp=%u type=0x%02X crc=%s\n", idx, expLen, buf[3], crcOk?"OK":"BAD");
+                if (crcOk) {
                     _lastResponseTime = millis();
                     _connected = true;
                     switch(buf[3]) {
