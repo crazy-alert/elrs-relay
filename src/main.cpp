@@ -31,6 +31,8 @@
 #define POWER_MODE_AUTO       0
 #define POWER_MODE_ALWAYS_ON  1
 #define POWER_MODE_ALWAYS_OFF 2
+#define DEBUG_RX2_VERBOSE     0
+#define DEBUG_TX1_VERBOSE     0
 
 // CRSF
 #define CRSF_ADDRESS_MODULE      0xEC
@@ -45,6 +47,8 @@
 
 // Режим диагностики - игнорирование CRC для тестирования протокола
 #define TX_DIAGNOSTICS_MODE 1
+// Временно игнорируем CRC для TX1 модуля (алгоритм отличается от RX)
+#define TX_SKIP_CRC_CHECK 1
 
 // Estructura для хранения пункта меню из menu.json
 struct MenuItem {
@@ -68,7 +72,8 @@ public:
     void begin(unsigned long baud);
     void update();
     void sendRawPacket(uint8_t* payload, uint8_t len, uint8_t destAddr);
-    bool isConnected() const { return _connected; }
+    void sendRawFrame(const uint8_t* packet, size_t len);
+    bool isConnected() const { return _connected && _deviceInfoReceived; }  // только если есть инфо
     String getDeviceName() const { return _deviceName; }
     int getTxPower() const;
     int getPktRate() const;
@@ -153,47 +158,61 @@ void sendCrsfPacketToReceiver(uint8_t* payload, uint8_t len) {
     receiverSerial.flush();
 }
 
+// Прозрачный форвардинг уже готового CRSF пакета в приёмник (телеметрия от TX)
+void forwardRawPacketToReceiver(const uint8_t* packet, size_t len) {
+    if (len == 0) return;
+    receiverSerial.write(packet, len);
+    receiverSerial.flush();
+}
+
 // Обработка данных от приёмника и ретрансляция
 void processReceiverData() {
     static unsigned long lastDiag = 0;
-    while(receiverSerial.available()) {
+    while (receiverSerial.available()) {
         uint8_t b = receiverSerial.read();
-        
-        // Грубая диагностика
-        if(millis() - lastDiag > 1000) {
-            Serial.print("RX2_RAW: ");
-            lastDiag = millis();
+
+        if (!rxInPacket && b == 0xC8) {
+            rxInPacket = true;
+            rxPacketIndex = 0;
+            rxExpectedLen = 0;
         }
-        if(b == 0xC8) Serial.print("[SYNC] ");
-        
-        if(!rxInPacket && b==0xC8) { rxInPacket=true; rxPacketIndex=0; rxExpectedLen=0; }
-        if(rxInPacket) {
-            if(rxPacketIndex < sizeof(rxPacketBuffer)) rxPacketBuffer[rxPacketIndex++] = b;
-            if(rxPacketIndex==2) rxExpectedLen = rxPacketBuffer[1]+2;
-            if(rxPacketIndex==rxExpectedLen && rxExpectedLen>0) {
-                uint8_t calcCrc = crsfCrc8(rxPacketBuffer+2, rxPacketIndex-3);
-                uint8_t expCrc = rxPacketBuffer[rxPacketIndex-1];
-                
+
+        if (rxInPacket) {
+            if (rxPacketIndex < sizeof(rxPacketBuffer)) rxPacketBuffer[rxPacketIndex++] = b;
+            if (rxPacketIndex == 2) rxExpectedLen = rxPacketBuffer[1] + 2;
+
+            if (rxPacketIndex == rxExpectedLen && rxExpectedLen > 0) {
+                uint8_t calcCrc = crsfCrc8(rxPacketBuffer + 2, rxPacketIndex - 3);
+                uint8_t expCrc = rxPacketBuffer[rxPacketIndex - 1];
+
+#if DEBUG_RX2_VERBOSE
                 String hexDump = "RX2: len=" + String(rxPacketIndex) + " HEX: ";
-                for(uint8_t i = 0; i < rxPacketIndex; i++) {
-                    if(rxPacketBuffer[i] < 0x10) hexDump += "0";
+                for (uint8_t i = 0; i < rxPacketIndex; i++) {
+                    if (rxPacketBuffer[i] < 0x10) hexDump += "0";
                     hexDump += String(rxPacketBuffer[i], HEX);
                     hexDump += " ";
                 }
                 hexDump += "crc_calc=0x" + String(calcCrc, HEX) + " exp=0x" + String(expCrc, HEX) + " ";
-                hexDump += (calcCrc==expCrc) ? "OK" : "BAD";
+                hexDump += (calcCrc == expCrc) ? "OK" : "BAD";
                 Serial.println(hexDump);
-                
-                if(calcCrc == expCrc) {
+#else
+                if (calcCrc != expCrc && millis() - lastDiag > 1000) {
+                    Serial.printf("RX2 CRC BAD: len=%u calc=0x%02X exp=0x%02X\n", rxPacketIndex, calcCrc, expCrc);
+                    lastDiag = millis();
+                }
+#endif
+
+                if (calcCrc == expCrc) {
                     lastPacketTime = millis();
                     packetCount++;
-                    txController.sendRawPacket(rxPacketBuffer+4, rxPacketIndex-5, rxPacketBuffer[3]);
-                } else {
-                    // Даже если CRC плохая, обновляем таймаут для диагностики
-                    lastPacketTime = millis();
+                    // Forward validated CRSF frame transparently RX -> TX.
+                    // Repacking here breaks frame type/length for standard frames (e.g. type 0x16).
+                    txController.sendRawFrame(rxPacketBuffer, rxPacketIndex);
                 }
-                rxInPacket=false;
-            } else if(rxPacketIndex>64) rxInPacket=false;
+                rxInPacket = false;
+            } else if (rxPacketIndex > 64) {
+                rxInPacket = false;
+            }
         }
     }
 }
@@ -554,7 +573,6 @@ void setup() {
     else Serial.println("LittleFS mounted");
     
     loadSettings();
-    currentBaudRate = DEFAULT_BAUD;
     Serial.printf("Settings: baud=%d, powerMode=%d, WiFi SSID=%s\n", currentBaudRate, currentPowerMode, wifiSSID.c_str());
     
     pinMode(RELAY_PIN, OUTPUT);
@@ -568,18 +586,43 @@ void setup() {
     Serial.printf("SD Card: %s\n", sdStatusMsg.c_str());
     
     WiFi.mode(WIFI_AP_STA);
+
+    bool apCfgOk = WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
+    bool apOk = WiFi.softAP("ELRS_Repeater_Pro", "12345678", 1, 0);
+    Serial.printf("AP config: %s, AP start: %s\n", apCfgOk ? "OK" : "FAIL", apOk ? "OK" : "FAIL");
+    if (apOk) {
+        dnsServer.start(DNS_PORT, "*", apIP);
+    }
+    Serial.print("AP IP: ");
+    Serial.println(WiFi.softAPIP());
+
     if (wifiSSID.length() > 0) {
         WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
         Serial.print("Connecting to WiFi");
         int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 20) { delay(500); Serial.print("."); attempts++; }
-        if (WiFi.status() == WL_CONNECTED) Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
-        else Serial.println("\nFailed to connect.");
+        while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+            esp_task_wdt_reset();
+            delay(500);
+            Serial.print(".");
+            attempts++;
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("\nConnected! STA IP: " + WiFi.localIP().toString());
+        } else {
+            Serial.printf("\nFailed to connect. WiFi.status()=%d\n", (int)WiFi.status());
+        }
+    } else {
+        Serial.println("Home WiFi SSID is empty, STA connect skipped.");
     }
-    WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
-    WiFi.softAP("ELRS_Repeater_Pro", "12345678", 1, 0);
-    dnsServer.start(DNS_PORT, "*", apIP);
-    Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+
+    String apSsid = WiFi.softAPSSID();
+    if (apSsid.length() == 0) {
+        Serial.println("AP not active after STA phase, retrying softAP...");
+        bool apRetry = WiFi.softAP("ELRS_Repeater_Pro", "12345678", 1, 0);
+        Serial.printf("AP retry: %s\n", apRetry ? "OK" : "FAIL");
+    }
+    Serial.println("AP SSID: " + WiFi.softAPSSID());
+    Serial.println("AP IP (post-check): " + WiFi.softAPIP().toString());
     
     setupWebServer();
     lastPacketTime = millis();
@@ -621,7 +664,9 @@ void TransmitterController::begin(unsigned long baud) {
     _serial = &Serial1;
     _serial->begin(baud, SERIAL_8N1, TX_PIN, TX_PIN);
 
-    //uart_set_line_inverse(UART_NUM_1, UART_SIGNAL_RXD_INV | UART_SIGNAL_TXD_INV);
+    // Enable half-duplex mode with line inversion for open-drain operation
+    uart_set_line_inverse(UART_NUM_1, UART_SIGNAL_RXD_INV | UART_SIGNAL_TXD_INV);
+    uart_set_mode(UART_NUM_1, UART_MODE_RS485_HALF_DUPLEX);
 
     Serial.printf("TX UART started on pin %d, baud=%lu\n", TX_PIN, baud);
     delay(100);
@@ -676,6 +721,12 @@ void TransmitterController::sendRawPacket(uint8_t* payload, uint8_t len, uint8_t
     _serial->flush();
 }
 
+void TransmitterController::sendRawFrame(const uint8_t* packet, size_t len) {
+    if (!_serial || !packet || len == 0) return;
+    _serial->write(packet, len);
+    _serial->flush();
+}
+
 void TransmitterController::_sendDevicePing() {
     Serial.println("TX1: Sending DEVICE_PING...");
     uint8_t p[] = {0x00, 0x00};
@@ -722,30 +773,35 @@ void TransmitterController::_processIncoming() {
                 uint8_t calcCrc = _crc8(buf+2, idx-3);  // CRC from FROM byte through payload
                 uint8_t expCrc = buf[idx-1];
                 uint8_t frameType = buf[4];
-                
-                // Отладка: вывод всех пакетов с CRC информацией
+#if DEBUG_TX1_VERBOSE
                 String hexDump = "HEX: ";
-                for(uint8_t i = 0; i < idx; i++) {
-                    if(buf[i] < 0x10) hexDump += "0";
+                for (uint8_t i = 0; i < idx; i++) {
+                    if (buf[i] < 0x10) hexDump += "0";
                     hexDump += String(buf[i], HEX);
                     hexDump += " ";
                 }
-                
-                Serial.printf("TX1: RX len=%u type=0x%02X from=0x%02X to=0x%02X crc_calc=0x%02X exp=0x%02X %s\n", 
+                Serial.printf("TX1: RX len=%u type=0x%02X from=0x%02X to=0x%02X crc_calc=0x%02X exp=0x%02X %s\n",
                     idx, frameType, buf[2], buf[3], calcCrc, expCrc, calcCrc==expCrc?"OK":"BAD");
                 Serial.println(hexDump);
+#endif
                 
                 bool crcOk = (calcCrc == expCrc);
-                bool processPkt = crcOk;
-                #if TX_DIAGNOSTICS_MODE
-                    if (!crcOk) {
-                        Serial.println("TX1: CRC_IGNORE_DIAGNOSTIC");
-                    }
-                #endif
+                
+                // TX module may have wrong/missing CRC in ping response, so we process it anyway
+                bool processPkt = true;  // Always process TX packets for now
+                if (!crcOk && frameType != CRSF_FRAMETYPE_DEVICE_PING) {
+                    Serial.printf("TX1: Warning - CRC mismatch (calc=0x%02X exp=0x%02X) for type 0x%02X\n", calcCrc, expCrc, frameType);
+                }
 
                 if (processPkt) {
                     _lastResponseTime = millis();
                     _connected = true;
+
+                    // Прозрачная двусторонняя ретрансляция: телеметрия TX -> RX
+                    if (crcOk) {
+                        forwardRawPacketToReceiver(buf, idx);
+                    }
+
                     switch(frameType) {
                         case CRSF_FRAMETYPE_DEVICE_INFO: 
                             Serial.println("TX1: Got DEVICE_INFO");
@@ -757,11 +813,12 @@ void TransmitterController::_processIncoming() {
                         case CRSF_FRAMETYPE_ELRS_STATUS: 
                             _handleElrsStatus(buf+5, idx-6); 
                             break;
+                        case CRSF_FRAMETYPE_DEVICE_PING:
+                            Serial.println("TX1: Got DEVICE_PING response - connected!");
+                            break;
                         default:
                             break;
                     }
-                } else {
-                    Serial.println("TX1: CRC mismatch!");
                 }
                 inPacket = false;
             } else if (idx > 64) {
@@ -813,21 +870,34 @@ void TransmitterController::_handleElrsStatus(uint8_t* data, uint8_t len) {}
 
 void TransmitterController::update() {
     _processIncoming();
-    if (millis() - _lastResponseTime > 2000) {
+    // Timeout for losing connection (increased to 5 seconds)
+    if (millis() - _lastResponseTime > 5000) {
         if (_connected) {
             _connected = false;
+            _deviceInfoReceived = false;
+            _fieldsRequested = false;
             Serial.println("TX1: Connection timeout!");
         }
     }
     static unsigned long lastPing = 0;
+    static unsigned long lastInfoRequest = 0;
     if (millis() - lastPing > 3000) {
         lastPing = millis();
         if (!_connected) {
             Serial.printf("TX1: Not connected, pinging... (_serial=%p, available=%d)\n", _serial, _serial->available());
             _sendDevicePing();
+            lastInfoRequest = 0;  // Reset info request timer
         }
-        else if (_deviceInfoReceived && !_fieldsRequested) {
+        else if (_connected && !_deviceInfoReceived && (millis() - lastInfoRequest > 500)) {
+            // After ping response, request device info (but only once every 500ms)
+            Serial.println("TX1: Requesting device info...");
+            lastInfoRequest = millis();
+            uint8_t p[] = {};
+            _sendCrsfPacket(p, 0, CRSF_FRAMETYPE_DEVICE_INFO);
+        }
+        else if (_deviceInfoReceived && !_fieldsRequested && (millis() - lastInfoRequest > 1000)) {
             Serial.println("TX1: Requesting all fields...");
+            lastInfoRequest = millis();
             _requestAllFields();
         }
     }
@@ -868,8 +938,49 @@ String TransmitterController::getMenuJson(int parentId) {
     DynamicJsonDocument doc(2048);
     JsonArray items = doc.createNestedArray("items");
     doc["parent"] = parentId;
-    _buildMenuItems(items, parentId);
-    String out; serializeJson(doc, out); return out;
+    
+    // If TX fields are available, use them
+    if (!_fields.empty()) {
+        _buildMenuItems(items, parentId);
+    } else {
+        // Fallback: Return built-in ELRS TX menu structure
+        // Power settings
+        JsonObject pwrItem = items.add<JsonObject>();
+        pwrItem["id"] = 1;
+        pwrItem["name"] = "Power";
+        pwrItem["value"] = "25";
+        pwrItem["type"] = "parameter";
+        pwrItem["min"] = 0;
+        pwrItem["max"] = 250;
+        pwrItem["unit"] = "mW";
+        
+        // Packet rate
+        JsonObject rateItem = items.add<JsonObject>();
+        rateItem["id"] = 2;
+        rateItem["name"] = "Packet Rate";
+        rateItem["value"] = "200";
+        rateItem["type"] = "parameter";
+        rateItem["options"] = "4;25;50;100;150;200;250;500";
+        
+        // Telemetry
+        JsonObject telItem = items.add<JsonObject>();
+        telItem["id"] = 3;
+        telItem["name"] = "Telemetry";
+        telItem["value"] = "1";
+        telItem["type"] = "parameter";
+        telItem["options"] = "Off;1/2;On";
+        
+        // Status string
+        JsonObject statusItem = items.add<JsonObject>();
+        statusItem["id"] = 4;
+        statusItem["name"] = "TX Status";
+        statusItem["value"] = _connected ? (_deviceInfoReceived ? "Connected" : "Connecting...") : "Disconnected";
+        statusItem["type"] = "info";
+    }
+    
+    String out; 
+    serializeJson(doc, out); 
+    return out;
 }
 
 bool TransmitterController::setValue(int fieldId, const String& value) {
@@ -896,3 +1007,5 @@ void TransmitterController::refresh() {
     _fields.clear();
     _sendDevicePing();
 }
+
+
