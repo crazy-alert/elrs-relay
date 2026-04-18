@@ -45,6 +45,9 @@
   <text class="small" x="450" y="462">2N7002</text>
   <text class="note" x="430" y="490">D -> bus</text>
   <text class="note" x="430" y="512">S -> GND</text>
+  <text class="txt" x="426" y="420">G</text>
+  <text class="txt" x="566" y="374">D</text>
+  <text class="txt" x="516" y="524">S</text>
 
   <!-- M_TX connections -->
   <line class="wire" x1="560" y1="378" x2="560" y2="300"/>
@@ -67,6 +70,9 @@
   <text class="small" x="680" y="534">2N7002</text>
   <text class="note" x="660" y="562">G -> bus</text>
   <text class="note" x="660" y="584">D -> ESP_RX</text>
+  <text class="txt" x="748" y="446">G</text>
+  <text class="txt" x="838" y="506">D</text>
+  <text class="txt" x="716" y="580">S</text>
 
   <!-- M_RX connections -->
   <line class="wire" x1="740" y1="450" x2="740" y2="300"/>
@@ -89,4 +95,5 @@
   <!-- Bottom notes -->
   <text class="note" x="46" y="776">Common ground required: ESP32 + ELRS TX + power source.</text>
   <text class="note" x="46" y="798">UART config in firmware must match inversion assumptions for RX/TX paths.</text>
+  <text class="note" x="640" y="798">2N7002 is MOSFET: pins are GATE / DRAIN / SOURCE (no BASE).</text>
 </svg>
