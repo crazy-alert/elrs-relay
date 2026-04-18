@@ -33,6 +33,9 @@
 #define POWER_MODE_ALWAYS_OFF 2
 #define DEBUG_RX2_VERBOSE     0
 #define DEBUG_TX1_VERBOSE     0
+#define AP_CHANNEL            6
+#define WIFI_CONNECT_TIMEOUT_MS 10000
+#define WIFI_RECONNECT_INTERVAL_MS 15000
 
 // CRSF
 #define CRSF_ADDRESS_MODULE      0xEC
@@ -137,6 +140,17 @@ String sdStatusMsg = "Not connected";
 
 String wifiSSID = "";
 String wifiPass = "";
+unsigned long lastWiFiAttemptMs = 0;
+unsigned long lastApCheckMs = 0;
+unsigned long txFramesIn = 0;
+unsigned long txFramesForwarded = 0;
+unsigned long txFramesCrcBad = 0;
+unsigned long txBytesIn = 0;
+unsigned long lastTxDiagPrintMs = 0;
+unsigned long prevTxBytesIn = 0;
+unsigned long prevTxFramesIn = 0;
+unsigned long prevTxFramesForwarded = 0;
+unsigned long prevTxFramesCrcBad = 0;
 
 // CRC8
 uint8_t crsfCrc8(const uint8_t* data, size_t len) {
@@ -165,6 +179,16 @@ void forwardRawPacketToReceiver(const uint8_t* packet, size_t len) {
     receiverSerial.flush();
 }
 
+void forwardFrameToReceiverByType(uint8_t frameType, const uint8_t* payload, size_t payloadLen) {
+    if (payloadLen + 1 > 60) return;
+    uint8_t out[64];
+    out[0] = frameType;
+    if (payloadLen > 0 && payload != nullptr) {
+        memcpy(out + 1, payload, payloadLen);
+    }
+    sendCrsfPacketToReceiver(out, payloadLen + 1);
+}
+
 // Обработка данных от приёмника и ретрансляция
 void processReceiverData() {
     static unsigned long lastDiag = 0;
@@ -179,7 +203,14 @@ void processReceiverData() {
 
         if (rxInPacket) {
             if (rxPacketIndex < sizeof(rxPacketBuffer)) rxPacketBuffer[rxPacketIndex++] = b;
-            if (rxPacketIndex == 2) rxExpectedLen = rxPacketBuffer[1] + 2;
+            if (rxPacketIndex == 2) {
+                uint8_t frameLen = rxPacketBuffer[1];
+                if (frameLen < 2 || frameLen > 62) {
+                    rxInPacket = false;
+                    continue;
+                }
+                rxExpectedLen = frameLen + 2;
+            }
 
             if (rxPacketIndex == rxExpectedLen && rxExpectedLen > 0) {
                 uint8_t calcCrc = crsfCrc8(rxPacketBuffer + 2, rxPacketIndex - 3);
@@ -210,7 +241,7 @@ void processReceiverData() {
                     txController.sendRawFrame(rxPacketBuffer, rxPacketIndex);
                 }
                 rxInPacket = false;
-            } else if (rxPacketIndex > 64) {
+            } else if (rxPacketIndex >= sizeof(rxPacketBuffer)) {
                 rxInPacket = false;
             }
         }
@@ -238,6 +269,46 @@ void saveWiFiSettings(const String& ssid, const String& pass) {
     prefs.end();
     wifiSSID = ssid;
     wifiPass = pass;
+}
+
+bool startSoftAP() {
+    bool apCfgOk = WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
+    bool apOk = WiFi.softAP("ELRS_Repeater_Pro", "12345678", AP_CHANNEL, 0);
+    Serial.printf("AP config: %s, AP start: %s\n", apCfgOk ? "OK" : "FAIL", apOk ? "OK" : "FAIL");
+    if (apOk) dnsServer.start(DNS_PORT, "*", apIP);
+    Serial.println("AP SSID: " + WiFi.softAPSSID());
+    Serial.println("AP IP: " + WiFi.softAPIP().toString());
+    return apOk;
+}
+
+void connectHomeWiFi(bool blocking) {
+    if (wifiSSID.length() == 0) return;
+    if (WiFi.status() == WL_CONNECTED) return;
+
+    unsigned long now = millis();
+    if (!blocking && (now - lastWiFiAttemptMs) < WIFI_RECONNECT_INTERVAL_MS) return;
+    lastWiFiAttemptMs = now;
+
+    WiFi.disconnect(false, false);
+    WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+
+    if (!blocking) {
+        Serial.println("STA reconnect started");
+        return;
+    }
+
+    Serial.print("Connecting to WiFi");
+    unsigned long started = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - started < WIFI_CONNECT_TIMEOUT_MS) {
+        esp_task_wdt_reset();
+        delay(250);
+        Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nConnected! STA IP: " + WiFi.localIP().toString());
+    } else {
+        Serial.printf("\nFailed to connect. WiFi.status()=%d\n", (int)WiFi.status());
+    }
 }
 
 // SD-карта
@@ -456,6 +527,10 @@ void handleApiStatus() {
     d["deviceName"] = txController.getDeviceName();
     d["baudrate"] = currentBaudRate;
     d["sd"] = sdStatusMsg;
+    d["txIn"] = txFramesIn;
+    d["txFwd"] = txFramesForwarded;
+    d["txCrcBad"] = txFramesCrcBad;
+    d["txBytesIn"] = txBytesIn;
     String s; serializeJson(d, s); server.send(200, "application/json", s);
 }
 void handleApiPowerMode() {
@@ -586,43 +661,12 @@ void setup() {
     Serial.printf("SD Card: %s\n", sdStatusMsg.c_str());
     
     WiFi.mode(WIFI_AP_STA);
+    WiFi.setSleep(false);
+    WiFi.setAutoReconnect(true);
 
-    bool apCfgOk = WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
-    bool apOk = WiFi.softAP("ELRS_Repeater_Pro", "12345678", 1, 0);
-    Serial.printf("AP config: %s, AP start: %s\n", apCfgOk ? "OK" : "FAIL", apOk ? "OK" : "FAIL");
-    if (apOk) {
-        dnsServer.start(DNS_PORT, "*", apIP);
-    }
-    Serial.print("AP IP: ");
-    Serial.println(WiFi.softAPIP());
-
-    if (wifiSSID.length() > 0) {
-        WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
-        Serial.print("Connecting to WiFi");
-        int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-            esp_task_wdt_reset();
-            delay(500);
-            Serial.print(".");
-            attempts++;
-        }
-        if (WiFi.status() == WL_CONNECTED) {
-            Serial.println("\nConnected! STA IP: " + WiFi.localIP().toString());
-        } else {
-            Serial.printf("\nFailed to connect. WiFi.status()=%d\n", (int)WiFi.status());
-        }
-    } else {
-        Serial.println("Home WiFi SSID is empty, STA connect skipped.");
-    }
-
-    String apSsid = WiFi.softAPSSID();
-    if (apSsid.length() == 0) {
-        Serial.println("AP not active after STA phase, retrying softAP...");
-        bool apRetry = WiFi.softAP("ELRS_Repeater_Pro", "12345678", 1, 0);
-        Serial.printf("AP retry: %s\n", apRetry ? "OK" : "FAIL");
-    }
-    Serial.println("AP SSID: " + WiFi.softAPSSID());
-    Serial.println("AP IP (post-check): " + WiFi.softAPIP().toString());
+    startSoftAP();
+    if (wifiSSID.length() > 0) connectHomeWiFi(true);
+    else Serial.println("Home WiFi SSID is empty, STA connect skipped.");
     
     setupWebServer();
     lastPacketTime = millis();
@@ -646,6 +690,37 @@ void loop() {
     }
     dnsServer.processNextRequest();
     server.handleClient();
+
+    if (WiFi.status() != WL_CONNECTED) {
+        connectHomeWiFi(false);
+    }
+
+    unsigned long now = millis();
+    if (now - lastApCheckMs > WIFI_RECONNECT_INTERVAL_MS) {
+        lastApCheckMs = now;
+        if (WiFi.softAPSSID().length() == 0) {
+            Serial.println("AP disappeared, restarting AP...");
+            startSoftAP();
+        }
+    }
+
+    if (now - lastTxDiagPrintMs > 2000) {
+        unsigned long dBytes = txBytesIn - prevTxBytesIn;
+        unsigned long dIn = txFramesIn - prevTxFramesIn;
+        unsigned long dFwd = txFramesForwarded - prevTxFramesForwarded;
+        unsigned long dBad = txFramesCrcBad - prevTxFramesCrcBad;
+        prevTxBytesIn = txBytesIn;
+        prevTxFramesIn = txFramesIn;
+        prevTxFramesForwarded = txFramesForwarded;
+        prevTxFramesCrcBad = txFramesCrcBad;
+        lastTxDiagPrintMs = now;
+
+        Serial.printf(
+            "TXDIAG total[bytes=%lu in=%lu fwd=%lu bad=%lu] delta[bytes=%lu in=%lu fwd=%lu bad=%lu]\n",
+            txBytesIn, txFramesIn, txFramesForwarded, txFramesCrcBad, dBytes, dIn, dFwd, dBad
+        );
+    }
+
     esp_task_wdt_reset();
     yield();
 }
@@ -761,18 +836,32 @@ void TransmitterController::_processIncoming() {
     static uint8_t expLen=0;
     while (_serial->available()) {
         uint8_t b = _serial->read();
-        if (!inPacket && b == 0xC8) { 
+        txBytesIn++;
+        if (!inPacket) {
             inPacket=true; 
             idx=0; 
             expLen=0; 
         }
         if (inPacket) {
             if (idx < sizeof(buf)) buf[idx++] = b;
-            if (idx == 2) expLen = buf[1] + 2;
+            if (idx == 2) {
+                uint8_t frameLen = buf[1];
+                if (frameLen < 2 || frameLen > 62) {
+                    inPacket = false;
+                    continue;
+                }
+                expLen = frameLen + 2;
+            }
             if (idx == expLen && expLen>0) {
-                uint8_t calcCrc = _crc8(buf+2, idx-3);  // CRC from FROM byte through payload
+                txFramesIn++;
                 uint8_t expCrc = buf[idx-1];
-                uint8_t frameType = buf[4];
+                bool hasExtendedHeader = (buf[0] == 0xC8 && idx >= 6);
+                uint8_t frameType = hasExtendedHeader ? buf[4] : buf[2];
+                uint8_t* payloadPtr = hasExtendedHeader ? (buf + 5) : (buf + 3);
+                uint8_t payloadLen = hasExtendedHeader ? (idx - 6) : (idx - 4);
+                uint8_t calcCrc = hasExtendedHeader
+                    ? _crc8(buf + 4, payloadLen + 1)   // type + payload
+                    : _crc8(buf + 2, idx - 3);         // type + payload
 #if DEBUG_TX1_VERBOSE
                 String hexDump = "HEX: ";
                 for (uint8_t i = 0; i < idx; i++) {
@@ -786,6 +875,7 @@ void TransmitterController::_processIncoming() {
 #endif
                 
                 bool crcOk = (calcCrc == expCrc);
+                if (!crcOk) txFramesCrcBad++;
                 
                 // TX module may have wrong/missing CRC in ping response, so we process it anyway
                 bool processPkt = true;  // Always process TX packets for now
@@ -799,19 +889,20 @@ void TransmitterController::_processIncoming() {
 
                     // Прозрачная двусторонняя ретрансляция: телеметрия TX -> RX
                     if (crcOk) {
-                        forwardRawPacketToReceiver(buf, idx);
+                        forwardFrameToReceiverByType(frameType, payloadPtr, payloadLen);
+                        txFramesForwarded++;
                     }
 
                     switch(frameType) {
                         case CRSF_FRAMETYPE_DEVICE_INFO: 
                             Serial.println("TX1: Got DEVICE_INFO");
-                            _handleDeviceInfo(buf+5, idx-6); 
+                            _handleDeviceInfo(payloadPtr, payloadLen); 
                             break;
                         case CRSF_FRAMETYPE_PARAMETER_DATA: 
-                            _handleParameterData(buf+5, idx-6); 
+                            _handleParameterData(payloadPtr, payloadLen); 
                             break;
                         case CRSF_FRAMETYPE_ELRS_STATUS: 
-                            _handleElrsStatus(buf+5, idx-6); 
+                            _handleElrsStatus(payloadPtr, payloadLen); 
                             break;
                         case CRSF_FRAMETYPE_DEVICE_PING:
                             Serial.println("TX1: Got DEVICE_PING response - connected!");
@@ -821,7 +912,7 @@ void TransmitterController::_processIncoming() {
                     }
                 }
                 inPacket = false;
-            } else if (idx > 64) {
+            } else if (idx >= sizeof(buf)) {
                 Serial.printf("TX1: packet too long (%u), resync\n", idx);
                 inPacket = false;
             }
