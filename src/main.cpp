@@ -22,7 +22,8 @@
 #define RELAY_PIN     5
 #define LED_PIN       2
 #define SD_CS_PIN     15
-#define TX_PIN        32      // Единая линия данных передатчика (S.Port)
+#define TX_MODULE_TX_PIN 32   // ESP32 -> инвертор -> S.Port (к передатчику)
+#define TX_MODULE_RX_PIN 33   // S.Port -> инвертор -> ESP32 (от передатчика)
 
 // Параметры
 #define DEFAULT_BAUD       400000
@@ -33,14 +34,18 @@
 #define POWER_MODE_ALWAYS_OFF 2
 #define DEBUG_RX2_VERBOSE     0
 #define DEBUG_TX1_VERBOSE     0
+#define DEBUG_TX1_RAW_CAPTURE 1
 #define AP_CHANNEL            6
 #define WIFI_CONNECT_TIMEOUT_MS 10000
 #define WIFI_RECONNECT_INTERVAL_MS 15000
 
 // CRSF
-#define CRSF_ADDRESS_MODULE      0xEC
-#define CRSF_ADDRESS_HANDSET     0xEE
-#define CRSF_ADDRESS_RECEIVER    0xEF
+// CRSF endpoint addresses (ELRS/Crossfire):
+// 0xEE - TX module, 0xEA - handset/radio, 0xEC - receiver
+#define CRSF_ADDRESS_MODULE      0xEE
+#define CRSF_ADDRESS_HANDSET     0xEA
+#define CRSF_ADDRESS_HANDSET_ALT 0xEF
+#define CRSF_ADDRESS_RECEIVER    0xEC
 #define CRSF_FRAMETYPE_DEVICE_PING       0x28
 #define CRSF_FRAMETYPE_DEVICE_INFO       0x29
 #define CRSF_FRAMETYPE_PARAMETER_DATA    0x2B
@@ -50,8 +55,8 @@
 
 // Режим диагностики - игнорирование CRC для тестирования протокола
 #define TX_DIAGNOSTICS_MODE 1
-// Временно игнорируем CRC для TX1 модуля (алгоритм отличается от RX)
-#define TX_SKIP_CRC_CHECK 1
+// Не игнорируем CRC: после корректного парсинга это индикатор реального качества линии.
+#define TX_SKIP_CRC_CHECK 0
 
 // Estructura для хранения пункта меню из menu.json
 struct MenuItem {
@@ -76,10 +81,25 @@ public:
     void update();
     void sendRawPacket(uint8_t* payload, uint8_t len, uint8_t destAddr);
     void sendRawFrame(const uint8_t* packet, size_t len);
-    bool isConnected() const { return _connected && _deviceInfoReceived; }  // только если есть инфо
+    bool isConnected() const { return _connected; }  // линк есть уже после ping/ответов
     String getDeviceName() const { return _deviceName; }
     int getTxPower() const;
+    String getTxPowerRead() const;
+    String getRfModeRead() const;
+    String getSwitchModeRead() const;
+    String getAntennaModeRead() const;
+    String getTelemRatioRead() const;
+    String getTxPowerSet() const { return _txPowerSet; }
+    String getRfModeSet() const { return _rfModeSet; }
+    String getSwitchModeSet() const { return _switchModeSet; }
+    String getAntennaModeSet() const { return _antennaModeSet; }
+    String getTelemRatioSet() const { return _telemRatioSet; }
     int getPktRate() const;
+    bool setTxPowerByName(const String& value);
+    bool setRfModeByName(const String& value);
+    bool setSwitchModeByName(const String& value);
+    bool setAntennaModeByName(const String& value);
+    bool setTelemRatioByName(const String& value);
     String getMenuJson(int parentId = 0);
     bool setValue(int fieldId, const String& value);
     bool executeCommand(int fieldId);
@@ -100,8 +120,17 @@ private:
     std::map<uint8_t, CRSFField> _fields;
     std::vector<MenuItem> _menuItems;
     bool _menuFromFile;
+    String _txPowerSet, _rfModeSet, _switchModeSet, _antennaModeSet, _telemRatioSet;
+    uint8_t _lastOutA[64], _lastOutB[64];
+    uint8_t _lastOutALen, _lastOutBLen;
+    unsigned long _lastOutAMs, _lastOutBMs;
 
     uint8_t _crc8(const uint8_t* d, size_t len);
+    void _rememberOutFrame(const uint8_t* frame, uint8_t len);
+    bool _isLikelyEchoFrame(const uint8_t* frame, uint8_t len) const;
+    int _findFieldIdByKeys(const std::vector<String>& keys) const;
+    String _getFieldValueByKeys(const std::vector<String>& keys) const;
+    bool _setFieldByKeys(const std::vector<String>& keys, const String& value, String& shadow);
     void _sendCrsfPacket(uint8_t* p, uint8_t len, uint8_t type);
     void _sendDevicePing();
     void _requestAllFields();
@@ -146,11 +175,18 @@ unsigned long txFramesIn = 0;
 unsigned long txFramesForwarded = 0;
 unsigned long txFramesCrcBad = 0;
 unsigned long txBytesIn = 0;
+unsigned long txAddrFramesIn = 0;
+unsigned long txStdFramesIn = 0;
+uint32_t txTypeSeen[256] = {0};
+uint32_t txTypeForwarded[256] = {0};
+unsigned long lastCopterTelemetryMs = 0;
 unsigned long lastTxDiagPrintMs = 0;
 unsigned long prevTxBytesIn = 0;
 unsigned long prevTxFramesIn = 0;
 unsigned long prevTxFramesForwarded = 0;
 unsigned long prevTxFramesCrcBad = 0;
+unsigned long prevTxAddrFramesIn = 0;
+unsigned long prevTxStdFramesIn = 0;
 
 // CRC8
 uint8_t crsfCrc8(const uint8_t* data, size_t len) {
@@ -180,13 +216,65 @@ void forwardRawPacketToReceiver(const uint8_t* packet, size_t len) {
 }
 
 void forwardFrameToReceiverByType(uint8_t frameType, const uint8_t* payload, size_t payloadLen) {
-    if (payloadLen + 1 > 60) return;
+    // Стандартный CRSF кадр (без address extension):
+    // [sync][len][type][payload...][crc]
+    if (payloadLen + 4 > 64) return;
     uint8_t out[64];
-    out[0] = frameType;
+    size_t idx = 0;
+    out[idx++] = 0xC8;
+    out[idx++] = static_cast<uint8_t>(payloadLen + 2); // type + crc
+    out[idx++] = frameType;
     if (payloadLen > 0 && payload != nullptr) {
-        memcpy(out + 1, payload, payloadLen);
+        memcpy(out + idx, payload, payloadLen);
+        idx += payloadLen;
     }
-    sendCrsfPacketToReceiver(out, payloadLen + 1);
+    out[idx++] = crsfCrc8(out + 2, idx - 2);
+    receiverSerial.write(out, idx);
+    receiverSerial.flush();
+}
+
+static bool isValidCrsfSyncByte(uint8_t b) {
+    return (b >= 0xC8 && b <= 0xEF);
+}
+
+static void printHexFrame(const char* prefix, const uint8_t* data, uint8_t len) {
+    Serial.printf("%s len=%u: ", prefix, len);
+    for (uint8_t i = 0; i < len; i++) {
+        Serial.printf("%02X", data[i]);
+        if (i + 1 < len) Serial.print(" ");
+    }
+    Serial.println();
+}
+
+static bool isDroneTelemetryFrameType(uint8_t frameType) {
+    // Для режима "максимум телеметрии": пропускаем всё, кроме сервисных
+    // кадров Lua/Device API (0x28..0x2E), чтобы не засорять поток управления модулем.
+    return !(frameType >= CRSF_FRAMETYPE_DEVICE_PING && frameType <= CRSF_FRAMETYPE_ELRS_STATUS);
+}
+
+static bool isCopterTelemetryEvidenceType(uint8_t frameType) {
+    // Типы, которые обычно приходят именно от FC/дрона, а не от линк-статистики ретранслятора.
+    switch (frameType) {
+        case 0x02: // GPS
+        case 0x07: // Vario
+        case 0x08: // Battery
+        case 0x09: // Baro altitude
+        case 0x0B: // Heartbeat
+        case 0x1E: // Attitude
+        case 0x21: // Flight mode
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool hasCopterAirLinkByLinkStats(uint8_t frameType, const uint8_t* payload, uint8_t payloadLen) {
+    // CRSF Link Statistics (0x14), payload[8] = downlink link quality.
+    // Для реального линка с бортом ожидаем downlink LQ > 0.
+    if (frameType == 0x14 && payload != nullptr && payloadLen >= 9) {
+        return payload[8] > 0;
+    }
+    return false;
 }
 
 // Обработка данных от приёмника и ретрансляция
@@ -195,7 +283,7 @@ void processReceiverData() {
     while (receiverSerial.available()) {
         uint8_t b = receiverSerial.read();
 
-        if (!rxInPacket && b == 0xC8) {
+        if (!rxInPacket && isValidCrsfSyncByte(b)) {
             rxInPacket = true;
             rxPacketIndex = 0;
             rxExpectedLen = 0;
@@ -285,10 +373,6 @@ void connectHomeWiFi(bool blocking) {
     if (wifiSSID.length() == 0) return;
     if (WiFi.status() == WL_CONNECTED) return;
 
-    unsigned long now = millis();
-    if (!blocking && (now - lastWiFiAttemptMs) < WIFI_RECONNECT_INTERVAL_MS) return;
-    lastWiFiAttemptMs = now;
-
     WiFi.disconnect(false, false);
     WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
 
@@ -366,7 +450,11 @@ async function refreshDisplay(){
     document.getElementById('linkRadio').innerHTML=d.linkRadio?'✅ CONNECTED':'❌ DISCONNECTED';
     document.getElementById('linkCopter').innerHTML=d.linkCopter?'✅ CONNECTED':'❌ DISCONNECTED';
     document.getElementById('packets').innerText=d.packets;
-    document.getElementById('txpower').innerText=d.txpower+' mW';
+    document.getElementById('txpower').innerText=(d.txPowerRead||'---')+' ('+(d.txPowerSet||'-')+')';
+    document.getElementById('rfmd').innerText=(d.rfmdRead||'---')+' ('+(d.rfmdSet||'-')+')';
+    document.getElementById('switchMode').innerText=(d.switchModeRead||'---')+' ('+(d.switchModeSet||'-')+')';
+    document.getElementById('antennaMode').innerText=(d.antennaModeRead||'---')+' ('+(d.antennaModeSet||'-')+')';
+    document.getElementById('telemRatio').innerText=(d.telemRatioRead||'---')+' ('+(d.telemRatioSet||'-')+')';
     document.getElementById('pktrate').innerText=d.pktrate+' Hz';
     document.getElementById('deviceName').innerText=d.deviceName;
     document.getElementById('baudrate').innerText=d.baudrate;
@@ -453,6 +541,13 @@ function saveWiFi(){
     .then(()=>{alert('Saved. Restarting...');setTimeout(()=>location.reload(),2000);});
 }
 
+async function applyTxNamed(apiPath,inputId){
+    const v = document.getElementById(inputId).value;
+    const r = await fetch(apiPath+'?value='+encodeURIComponent(v));
+    if(!r.ok){ alert('TX apply failed ('+r.status+')'); }
+    await refreshDisplay();
+}
+
 setInterval(refreshDisplay, 1000);
 window.onload=()=>{ fullUpdate(); };
 </script>
@@ -471,6 +566,10 @@ window.onload=()=>{ fullUpdate(); };
         <tr><th>Link Copter</th><td id="linkCopter">---</td></tr>
         <tr><th>Packets</th><td id="packets">---</td></tr>
         <tr><th>TX Power</th><td id="txpower">---</td></tr>
+        <tr><th>RFMD</th><td id="rfmd">---</td></tr>
+        <tr><th>Switch Mode</th><td id="switchMode">---</td></tr>
+        <tr><th>Antenna Mode</th><td id="antennaMode">---</td></tr>
+        <tr><th>Telem Ratio</th><td id="telemRatio">---</td></tr>
         <tr><th>Packet Rate</th><td id="pktrate">---</td></tr>
         <tr><th>CRSF Baudrate</th><td id="baudrate">---</td></tr>
         <tr><th>SD Card</th><td id="sdStatus">---</td></tr>
@@ -482,6 +581,76 @@ window.onload=()=>{ fullUpdate(); };
         <button onclick="applyPower()">Apply</button>
         <hr><table><tr><th>Relay State</th><td id="relayState">---</td></tr>
         <tr><th>Selected Mode</th><td id="powerModeText">---</td></tr></table>
+    </div>
+    <div class="card"><h3>TX Quick Control</h3>
+        <div class="flex" style="align-items:center">
+            <label>TX Power:</label>
+            <select id="setTxPower"><option value="10">10</option><option value="25">25</option><option value="50">50</option><option value="100">100</option><option value="250">250</option><option value="500">500</option><option value="1000">1000</option></select>
+            <button onclick="applyTxNamed('/api/tx/setPower','setTxPower')">Apply</button>
+        </div>
+        <br>
+        <div class="flex" style="align-items:center">
+            <label>RFMD:</label>
+            <select id="setRfmd">
+                <option value="25Hz">0 - 900 - 25Hz LoRa -123dBm</option>
+                <option value="50Hz">1 - 900 - 50Hz LoRa -120dBm</option>
+                <option value="100Hz">2 - 900 - 100Hz LoRa -117dBm</option>
+                <option value="100Hz Full">3 - 900 - 100Hz Full -112dBm</option>
+                <option value="200Hz">5 - 900 - 200Hz LoRa -112dBm</option>
+                <option value="200Hz Full">6 - 900 - 200Hz Full -111dBm</option>
+                <option value="250Hz">7 - 900 - 250Hz LoRa -111dBm</option>
+                <option value="D50">10 - 900 - D50 -112dBm</option>
+                <option value="K1000 Full">11 - 900 - K1000 Full -101dBm</option>
+
+                <option value="50Hz">21 - 2.4 - 50Hz LoRa -115dBm</option>
+                <option value="100Hz Full">23 - 2.4 - 100Hz Full -112dBm</option>
+                <option value="150Hz">24 - 2.4 - 150Hz LoRa -112dBm</option>
+                <option value="250Hz">27 - 2.4 - 250Hz LoRa -108dBm</option>
+                <option value="333Hz Full">28 - 2.4 - 333Hz Full -105dBm</option>
+                <option value="500Hz">29 - 2.4 - 500Hz LoRa -105dBm</option>
+                <option value="D250">30 - 2.4 - D250 -104dBm</option>
+                <option value="D500">31 - 2.4 - D500 -104dBm</option>
+                <option value="F500">32 - 2.4 - F500 -104dBm</option>
+                <option value="F1000">33 - 2.4 - F1000 -104dBm</option>
+                <option value="DK250">34 - 2.4 - DK250 -103dBm</option>
+                <option value="DK500">35 - 2.4 - DK500 -103dBm</option>
+                <option value="K1000">36 - 2.4 - K1000 -103dBm</option>
+
+                <option value="100Hz Full">100 - X-Band - 100Hz Full -112dBm</option>
+                <option value="150Hz">101 - X-Band - 150Hz -112dBm</option>
+            </select>
+            <button onclick="applyTxNamed('/api/tx/setRfmd','setRfmd')">Apply</button>
+        </div>
+        <br>
+        <div class="flex" style="align-items:center">
+            <label>Switch Mode:</label>
+            <select id="setSwitchMode">
+                <option value="Hybrid">Hybrid</option><option value="Wide">Wide</option>
+                <option value="8ch">Full Res 8ch</option><option value="12ch Mixed">Full Res 12ch Mixed</option>
+                <option value="16ch Rate/2">Full Res 16ch Rate/2</option>
+            </select>
+            <button onclick="applyTxNamed('/api/tx/setSwitchMode','setSwitchMode')">Apply</button>
+        </div>
+        <br>
+        <div class="flex" style="align-items:center">
+            <label>Antenna Mode:</label>
+            <select id="setAntennaMode">
+                <option value="Gemini">Gemini</option><option value="Ant 1">Ant 1</option>
+                <option value="Ant 2">Ant 2</option><option value="Switch">Switch</option>
+            </select>
+            <button onclick="applyTxNamed('/api/tx/setAntennaMode','setAntennaMode')">Apply</button>
+        </div>
+        <br>
+        <div class="flex" style="align-items:center">
+            <label>Telem Ratio:</label>
+            <select id="setTelemRatio">
+                <option value="Std">Std</option><option value="1:2">1:2</option><option value="1:4">1:4</option>
+                <option value="1:8">1:8</option><option value="1:16">1:16</option><option value="1:32">1:32</option>
+                <option value="1:64">1:64</option><option value="1:128">1:128</option>
+                <option value="Race">Race</option><option value="Off">Off</option>
+            </select>
+            <button onclick="applyTxNamed('/api/tx/setTelemRatio','setTelemRatio')">Apply</button>
+        </div>
     </div>
     <div class="card"><h3>System</h3>
     </div>
@@ -518,12 +687,22 @@ window.onload=()=>{ fullUpdate(); };
 
 // API
 void handleApiStatus() {
-    DynamicJsonDocument d(256);
+    DynamicJsonDocument d(640);
     d["linkRadio"] = linkToRadio;
-    d["linkCopter"] = txController.isConnected();
+    d["linkCopter"] = (millis() - lastCopterTelemetryMs) < 2000;
     d["packets"] = packetCount;
     d["txpower"] = txController.getTxPower();
     d["pktrate"] = txController.getPktRate();
+    d["txPowerRead"] = txController.getTxPowerRead();
+    d["txPowerSet"] = txController.getTxPowerSet();
+    d["rfmdRead"] = txController.getRfModeRead();
+    d["rfmdSet"] = txController.getRfModeSet();
+    d["switchModeRead"] = txController.getSwitchModeRead();
+    d["switchModeSet"] = txController.getSwitchModeSet();
+    d["antennaModeRead"] = txController.getAntennaModeRead();
+    d["antennaModeSet"] = txController.getAntennaModeSet();
+    d["telemRatioRead"] = txController.getTelemRatioRead();
+    d["telemRatioSet"] = txController.getTelemRatioSet();
     d["deviceName"] = txController.getDeviceName();
     d["baudrate"] = currentBaudRate;
     d["sd"] = sdStatusMsg;
@@ -561,6 +740,26 @@ void handleApiTxSet() {
     if(server.hasArg("id")&&server.hasArg("value"))
         server.send(txController.setValue(server.arg("id").toInt(),server.arg("value"))?200:400);
     else server.send(400);
+}
+void handleApiTxSetPower() {
+    if (!server.hasArg("value")) { server.send(400, "text/plain", "Missing value"); return; }
+    server.send(txController.setTxPowerByName(server.arg("value")) ? 200 : 400);
+}
+void handleApiTxSetRfmd() {
+    if (!server.hasArg("value")) { server.send(400, "text/plain", "Missing value"); return; }
+    server.send(txController.setRfModeByName(server.arg("value")) ? 200 : 400);
+}
+void handleApiTxSetSwitchMode() {
+    if (!server.hasArg("value")) { server.send(400, "text/plain", "Missing value"); return; }
+    server.send(txController.setSwitchModeByName(server.arg("value")) ? 200 : 400);
+}
+void handleApiTxSetAntennaMode() {
+    if (!server.hasArg("value")) { server.send(400, "text/plain", "Missing value"); return; }
+    server.send(txController.setAntennaModeByName(server.arg("value")) ? 200 : 400);
+}
+void handleApiTxSetTelemRatio() {
+    if (!server.hasArg("value")) { server.send(400, "text/plain", "Missing value"); return; }
+    server.send(txController.setTelemRatioByName(server.arg("value")) ? 200 : 400);
 }
 void handleApiTxCommand() {
     if(server.hasArg("id")) server.send(txController.executeCommand(server.arg("id").toInt())?200:400);
@@ -620,6 +819,11 @@ void setupWebServer() {
     server.on("/api/enableRxWifi", handleApiEnableRxWifi);
     server.on("/api/tx/menu", handleApiTxMenu);
     server.on("/api/tx/set", handleApiTxSet);
+    server.on("/api/tx/setPower", handleApiTxSetPower);
+    server.on("/api/tx/setRfmd", handleApiTxSetRfmd);
+    server.on("/api/tx/setSwitchMode", handleApiTxSetSwitchMode);
+    server.on("/api/tx/setAntennaMode", handleApiTxSetAntennaMode);
+    server.on("/api/tx/setTelemRatio", handleApiTxSetTelemRatio);
     server.on("/api/tx/command", handleApiTxCommand);
     server.on("/tx_interface.html", handleTxInterface);
     server.on("/lua", handleTxInterface);
@@ -662,7 +866,7 @@ void setup() {
     
     WiFi.mode(WIFI_AP_STA);
     WiFi.setSleep(false);
-    WiFi.setAutoReconnect(true);
+    WiFi.setAutoReconnect(false);
 
     startSoftAP();
     if (wifiSSID.length() > 0) connectHomeWiFi(true);
@@ -691,10 +895,6 @@ void loop() {
     dnsServer.processNextRequest();
     server.handleClient();
 
-    if (WiFi.status() != WL_CONNECTED) {
-        connectHomeWiFi(false);
-    }
-
     unsigned long now = millis();
     if (now - lastApCheckMs > WIFI_RECONNECT_INTERVAL_MS) {
         lastApCheckMs = now;
@@ -709,15 +909,27 @@ void loop() {
         unsigned long dIn = txFramesIn - prevTxFramesIn;
         unsigned long dFwd = txFramesForwarded - prevTxFramesForwarded;
         unsigned long dBad = txFramesCrcBad - prevTxFramesCrcBad;
+        unsigned long dAddr = txAddrFramesIn - prevTxAddrFramesIn;
+        unsigned long dStd = txStdFramesIn - prevTxStdFramesIn;
         prevTxBytesIn = txBytesIn;
         prevTxFramesIn = txFramesIn;
         prevTxFramesForwarded = txFramesForwarded;
         prevTxFramesCrcBad = txFramesCrcBad;
+        prevTxAddrFramesIn = txAddrFramesIn;
+        prevTxStdFramesIn = txStdFramesIn;
         lastTxDiagPrintMs = now;
 
         Serial.printf(
-            "TXDIAG total[bytes=%lu in=%lu fwd=%lu bad=%lu] delta[bytes=%lu in=%lu fwd=%lu bad=%lu]\n",
-            txBytesIn, txFramesIn, txFramesForwarded, txFramesCrcBad, dBytes, dIn, dFwd, dBad
+            "TXDIAG total[bytes=%lu in=%lu fwd=%lu bad=%lu addr=%lu std=%lu] delta[bytes=%lu in=%lu fwd=%lu bad=%lu addr=%lu std=%lu]\n",
+            txBytesIn, txFramesIn, txFramesForwarded, txFramesCrcBad, txAddrFramesIn, txStdFramesIn,
+            dBytes, dIn, dFwd, dBad, dAddr, dStd
+        );
+        Serial.printf(
+            "TXTYPES in[02=%lu 07=%lu 08=%lu 09=%lu 0B=%lu 14=%lu 1C=%lu 1E=%lu 21=%lu 29=%lu 2B=%lu] fwd[02=%lu 07=%lu 08=%lu 09=%lu 0B=%lu 14=%lu 1C=%lu 1E=%lu 21=%lu 29=%lu 2B=%lu]\n",
+            txTypeSeen[0x02], txTypeSeen[0x07], txTypeSeen[0x08], txTypeSeen[0x09], txTypeSeen[0x0B],
+            txTypeSeen[0x14], txTypeSeen[0x1C], txTypeSeen[0x1E], txTypeSeen[0x21], txTypeSeen[0x29], txTypeSeen[0x2B],
+            txTypeForwarded[0x02], txTypeForwarded[0x07], txTypeForwarded[0x08], txTypeForwarded[0x09], txTypeForwarded[0x0B],
+            txTypeForwarded[0x14], txTypeForwarded[0x1C], txTypeForwarded[0x1E], txTypeForwarded[0x21], txTypeForwarded[0x29], txTypeForwarded[0x2B]
         );
     }
 
@@ -728,22 +940,24 @@ void loop() {
 // ========== РЕАЛИЗАЦИЯ TransmitterController (полудуплекс, открытый сток) ==========
 TransmitterController::TransmitterController() :
     _serial(nullptr), _connected(false), _lastResponseTime(0),
-    _deviceInfoReceived(false), _fieldsRequested(false) {}
+    _deviceInfoReceived(false), _fieldsRequested(false),
+    _txPowerSet("-"), _rfModeSet("-"), _switchModeSet("-"), _antennaModeSet("-"), _telemRatioSet("-"),
+    _lastOutALen(0), _lastOutBLen(0), _lastOutAMs(0), _lastOutBMs(0) {}
 
 void TransmitterController::begin(unsigned long baud) {
     // Настраиваем пин как открытый сток
-    pinMode(TX_PIN, OUTPUT_OPEN_DRAIN);
-    digitalWrite(TX_PIN, HIGH);
+    pinMode(TX_MODULE_TX_PIN, OUTPUT);
+    pinMode(TX_MODULE_RX_PIN, INPUT);
 
     // Инициализация UART с одним пином для RX и TX
     _serial = &Serial1;
-    _serial->begin(baud, SERIAL_8N1, TX_PIN, TX_PIN);
+    _serial->begin(baud, SERIAL_8N1, TX_MODULE_RX_PIN, TX_MODULE_TX_PIN);
 
-    // Enable half-duplex mode with line inversion for open-drain operation
-    uart_set_line_inverse(UART_NUM_1, UART_SIGNAL_RXD_INV | UART_SIGNAL_TXD_INV);
-    uart_set_mode(UART_NUM_1, UART_MODE_RS485_HALF_DUPLEX);
+    // Инверсию делает внешний инвертор на 2N7002.
+    uart_set_mode(UART_NUM_1, UART_MODE_UART);
+    uart_set_line_inverse(UART_NUM_1, UART_SIGNAL_INV_DISABLE);
 
-    Serial.printf("TX UART started on pin %d, baud=%lu\n", TX_PIN, baud);
+    Serial.printf("TX UART started: RX=%d TX=%d baud=%lu\n", TX_MODULE_RX_PIN, TX_MODULE_TX_PIN, baud);
     delay(100);
     _sendDevicePing();
     _lastResponseTime = millis();
@@ -761,37 +975,78 @@ uint8_t TransmitterController::_crc8(const uint8_t* data, size_t len) {
     return crc;
 }
 
-void TransmitterController::_sendCrsfPacket(uint8_t* payload, uint8_t len, uint8_t packetType) {
-    uint8_t packet[64];
-    uint8_t idx = 0;
-    packet[idx++] = 0xC8;
-    packet[idx++] = len + 2;
-    packet[idx++] = CRSF_ADDRESS_MODULE;
-    packet[idx++] = CRSF_ADDRESS_HANDSET;
-    packet[idx++] = packetType;
-    memcpy(packet + idx, payload, len);
-    idx += len;
-    packet[idx] = _crc8(packet + 2, idx - 2);
-    idx++;
+void TransmitterController::_rememberOutFrame(const uint8_t* frame, uint8_t len) {
+    if (!frame || len == 0 || len > sizeof(_lastOutA)) return;
+    memcpy(_lastOutB, _lastOutA, _lastOutALen);
+    _lastOutBLen = _lastOutALen;
+    _lastOutBMs = _lastOutAMs;
+    memcpy(_lastOutA, frame, len);
+    _lastOutALen = len;
+    _lastOutAMs = millis();
+}
 
-    Serial.printf("TX1: Sending pkt len=%u type=0x%02X crc=0x%02X\n", idx, packetType, packet[idx-1]);
-    _serial->write(packet, idx);
-    _serial->flush();
+bool TransmitterController::_isLikelyEchoFrame(const uint8_t* frame, uint8_t len) const {
+    if (!frame || len == 0) return false;
+    unsigned long now = millis();
+    const unsigned long windowMs = 300;
+    if (_lastOutALen == len && (now - _lastOutAMs) <= windowMs && memcmp(_lastOutA, frame, len) == 0) return true;
+    if (_lastOutBLen == len && (now - _lastOutBMs) <= windowMs && memcmp(_lastOutB, frame, len) == 0) return true;
+    return false;
+}
+
+void TransmitterController::_sendCrsfPacket(uint8_t* payload, uint8_t len, uint8_t packetType) {
+    auto sendOne = [&](uint8_t originAddr) {
+        uint8_t packet[64];
+        uint8_t idx = 0;
+        packet[idx++] = CRSF_ADDRESS_MODULE;
+        // Extended CRSF frame:
+        // [sync][len][type][dest][origin][payload...][crc]
+        packet[idx++] = len + 4;
+        packet[idx++] = packetType;
+        packet[idx++] = CRSF_ADDRESS_MODULE;
+        packet[idx++] = originAddr;
+        if (len > 0 && payload != nullptr) {
+            memcpy(packet + idx, payload, len);
+            idx += len;
+        }
+        packet[idx] = _crc8(packet + 2, idx - 2);
+        idx++;
+
+        Serial.printf("TX1: Sending pkt len=%u type=0x%02X origin=0x%02X crc=0x%02X\n",
+            idx, packetType, originAddr, packet[idx - 1]);
+#if DEBUG_TX1_RAW_CAPTURE
+        printHexFrame("TX1 RAW OUT", packet, idx);
+#endif
+        _rememberOutFrame(packet, idx);
+        _serial->write(packet, idx);
+        _serial->flush();
+    };
+
+    sendOne(CRSF_ADDRESS_HANDSET);
+    // ELRS 4+ compatibility: some stacks identify host as 0xEF (handset)
+    if (packetType >= CRSF_FRAMETYPE_DEVICE_PING && packetType <= CRSF_FRAMETYPE_PARAMETER_WRITE &&
+        CRSF_ADDRESS_HANDSET_ALT != CRSF_ADDRESS_HANDSET) {
+        delay(1);
+        sendOne(CRSF_ADDRESS_HANDSET_ALT);
+    }
 }
 
 void TransmitterController::sendRawPacket(uint8_t* payload, uint8_t len, uint8_t destAddr) {
     uint8_t packet[64];
     uint8_t idx = 0;
-    packet[idx++] = 0xC8;
-    packet[idx++] = len + 2;
+    packet[idx++] = CRSF_ADDRESS_MODULE;
+    packet[idx++] = len + 4;
+    packet[idx++] = destAddr;
     packet[idx++] = CRSF_ADDRESS_MODULE;
     packet[idx++] = CRSF_ADDRESS_HANDSET;
-    packet[idx++] = destAddr;
-    memcpy(packet + idx, payload, len);
-    idx += len;
+    if (len > 0 && payload != nullptr) {
+        memcpy(packet + idx, payload, len);
+        idx += len;
+    }
     packet[idx] = _crc8(packet + 2, idx - 2);
     idx++;
 
+    _rememberOutFrame(packet, idx);
     _serial->write(packet, idx);
     _serial->flush();
 }
@@ -804,43 +1059,54 @@ void TransmitterController::sendRawFrame(const uint8_t* packet, size_t len) {
 
 void TransmitterController::_sendDevicePing() {
     Serial.println("TX1: Sending DEVICE_PING...");
-    uint8_t p[] = {0x00, 0x00};
-    _sendCrsfPacket(p, 2, CRSF_FRAMETYPE_DEVICE_PING);
+    _sendCrsfPacket(nullptr, 0, CRSF_FRAMETYPE_DEVICE_PING);
 }
 
 void TransmitterController::_requestField(uint8_t fieldId) {
-    uint8_t p[] = {0x00, 0x00, fieldId, 0x00};
-    _sendCrsfPacket(p, 4, CRSF_FRAMETYPE_PARAMETER_REQUEST);
+    // Parameter request payload: [fieldId][chunk]
+    uint8_t p[] = {fieldId, 0x00};
+    _sendCrsfPacket(p, 2, CRSF_FRAMETYPE_PARAMETER_REQUEST);
 }
 
 void TransmitterController::_requestAllFields() {
-    for (auto& pair : _fields) _requestField(pair.first);
+    // On first sync _fields is empty, so we must actively probe parameter IDs.
+    // ELRS modules typically expose parameters in low ID range.
+    for (uint8_t id = 0; id <= 80; id++) {
+        _requestField(id);
+        delay(2);
+    }
+    Serial.println("TX1: Requested parameter fields 0..80");
     _fieldsRequested = true;
 }
 
 void TransmitterController::_writeParameter(uint8_t fieldId, uint32_t value) {
-    uint8_t p[7] = {0x00, 0x00, fieldId};
-    p[3] = value & 0xFF; p[4] = (value>>8)&0xFF; p[5] = (value>>16)&0xFF; p[6] = (value>>24)&0xFF;
-    _sendCrsfPacket(p, 7, CRSF_FRAMETYPE_PARAMETER_WRITE);
+    uint8_t p[5] = {fieldId};
+    p[1] = value & 0xFF;
+    p[2] = (value >> 8) & 0xFF;
+    p[3] = (value >> 16) & 0xFF;
+    p[4] = (value >> 24) & 0xFF;
+    _sendCrsfPacket(p, 5, CRSF_FRAMETYPE_PARAMETER_WRITE);
 }
 
 void TransmitterController::_writeParameter(uint8_t fieldId, const uint8_t* data, uint8_t len) {
-    uint8_t p[64] = {0x00, 0x00, fieldId};
-    memcpy(p+3, data, len);
-    _sendCrsfPacket(p, 3+len, CRSF_FRAMETYPE_PARAMETER_WRITE);
+    uint8_t p[64] = {fieldId};
+    memcpy(p + 1, data, len);
+    _sendCrsfPacket(p, 1 + len, CRSF_FRAMETYPE_PARAMETER_WRITE);
 }
 
 void TransmitterController::_processIncoming() {
     static uint8_t buf[128], idx=0;
     static bool inPacket=false;
     static uint8_t expLen=0;
+    static uint16_t rawDumpBudget = 80;
     while (_serial->available()) {
         uint8_t b = _serial->read();
         txBytesIn++;
         if (!inPacket) {
-            inPacket=true; 
-            idx=0; 
-            expLen=0; 
+            if (!isValidCrsfSyncByte(b)) continue;
+            inPacket = true;
+            idx = 0;
+            expLen = 0;
         }
         if (inPacket) {
             if (idx < sizeof(buf)) buf[idx++] = b;
@@ -853,15 +1119,55 @@ void TransmitterController::_processIncoming() {
                 expLen = frameLen + 2;
             }
             if (idx == expLen && expLen>0) {
+                if (_isLikelyEchoFrame(buf, idx)) {
+#if DEBUG_TX1_RAW_CAPTURE
+                    Serial.println("TX1: Echo frame dropped");
+#endif
+                    inPacket = false;
+                    continue;
+                }
                 txFramesIn++;
                 uint8_t expCrc = buf[idx-1];
-                bool hasExtendedHeader = (buf[0] == 0xC8 && idx >= 6);
-                uint8_t frameType = hasExtendedHeader ? buf[4] : buf[2];
-                uint8_t* payloadPtr = hasExtendedHeader ? (buf + 5) : (buf + 3);
-                uint8_t payloadLen = hasExtendedHeader ? (idx - 6) : (idx - 4);
-                uint8_t calcCrc = hasExtendedHeader
-                    ? _crc8(buf + 4, payloadLen + 1)   // type + payload
-                    : _crc8(buf + 2, idx - 3);         // type + payload
+                // Supported layouts:
+                // 1) standard: [sync][len][type][payload...][crc]
+                // 2) extended: [sync][len][type][dest][origin][payload...][crc]
+                // 3) legacy addressed (older local format): [sync][len][to][from][type][payload...][crc]
+                bool isLegacyAddressed = (
+                    idx >= 6 &&
+                    (buf[2] >= 0xC8) &&
+                    (buf[3] >= 0xC8)
+                );
+                bool isExtended = (
+                    !isLegacyAddressed &&
+                    idx >= 6 &&
+                    (buf[2] >= CRSF_FRAMETYPE_DEVICE_PING && buf[2] <= CRSF_FRAMETYPE_ELRS_STATUS) &&
+                    (buf[3] >= 0xE0) &&
+                    (buf[4] >= 0xE0)
+                );
+
+                if (isLegacyAddressed || isExtended) txAddrFramesIn++;
+                else txStdFramesIn++;
+
+                uint8_t frameType = isLegacyAddressed ? buf[4] : buf[2];
+                txTypeSeen[frameType]++;
+
+                uint8_t* payloadPtr = nullptr;
+                uint8_t payloadLen = 0;
+                uint8_t calcCrc = 0;
+
+                if (isLegacyAddressed) {
+                    payloadPtr = buf + 5;
+                    payloadLen = idx - 6;
+                    calcCrc = _crc8(buf + 4, payloadLen + 1);      // type+payload
+                } else if (isExtended) {
+                    payloadPtr = buf + 5;
+                    payloadLen = idx - 6;
+                    calcCrc = _crc8(buf + 2, idx - 3);             // type+dest+origin+payload
+                } else {
+                    payloadPtr = buf + 3;
+                    payloadLen = idx - 4;
+                    calcCrc = _crc8(buf + 2, idx - 3);             // type+payload
+                }
 #if DEBUG_TX1_VERBOSE
                 String hexDump = "HEX: ";
                 for (uint8_t i = 0; i < idx; i++) {
@@ -876,6 +1182,23 @@ void TransmitterController::_processIncoming() {
                 
                 bool crcOk = (calcCrc == expCrc);
                 if (!crcOk) txFramesCrcBad++;
+
+#if DEBUG_TX1_RAW_CAPTURE
+                bool isInterestingType =
+                    frameType == CRSF_FRAMETYPE_DEVICE_PING ||
+                    frameType == CRSF_FRAMETYPE_DEVICE_INFO ||
+                    frameType == CRSF_FRAMETYPE_PARAMETER_DATA ||
+                    frameType == CRSF_FRAMETYPE_PARAMETER_REQUEST ||
+                    frameType == CRSF_FRAMETYPE_PARAMETER_WRITE ||
+                    frameType == CRSF_FRAMETYPE_ELRS_STATUS;
+                if ((rawDumpBudget > 0 && isInterestingType) || !crcOk) {
+                    const char* layout = isExtended ? "ext" : (isLegacyAddressed ? "legacy" : "std");
+                    Serial.printf("TX1 RAW IN meta: layout=%s type=0x%02X crc=%s calc=0x%02X exp=0x%02X\n",
+                        layout, frameType, crcOk ? "OK" : "BAD", calcCrc, expCrc);
+                    printHexFrame("TX1 RAW IN", buf, idx);
+                    if (rawDumpBudget > 0) rawDumpBudget--;
+                }
+#endif
                 
                 // TX module may have wrong/missing CRC in ping response, so we process it anyway
                 bool processPkt = true;  // Always process TX packets for now
@@ -883,23 +1206,62 @@ void TransmitterController::_processIncoming() {
                     Serial.printf("TX1: Warning - CRC mismatch (calc=0x%02X exp=0x%02X) for type 0x%02X\n", calcCrc, expCrc, frameType);
                 }
 
-                if (processPkt) {
+                // Ignore local echo of our own extended requests:
+                // [type][dest=MODULE][origin=HANDSET]...
+                bool isOwnEcho = false;
+                if (isExtended && payloadLen >= 0) {
+                    uint8_t dest = buf[3];
+                    uint8_t origin = buf[4];
+                    bool isDeviceCmd =
+                        frameType == CRSF_FRAMETYPE_DEVICE_PING ||
+                        frameType == CRSF_FRAMETYPE_DEVICE_INFO ||
+                        frameType == CRSF_FRAMETYPE_PARAMETER_REQUEST ||
+                        frameType == CRSF_FRAMETYPE_PARAMETER_WRITE;
+                    if (isDeviceCmd &&
+                        dest == CRSF_ADDRESS_MODULE &&
+                        (origin == CRSF_ADDRESS_HANDSET || origin == CRSF_ADDRESS_HANDSET_ALT)) {
+                        isOwnEcho = true;
+                    }
+                }
+
+                if (processPkt && !isOwnEcho) {
+                    if (frameType == CRSF_FRAMETYPE_DEVICE_INFO || frameType == CRSF_FRAMETYPE_PARAMETER_DATA) {
+                        if (isExtended) {
+                            Serial.printf("TX1: RX type=0x%02X ext dest=0x%02X origin=0x%02X payloadLen=%u\n",
+                                frameType, buf[3], buf[4], payloadLen);
+                        } else if (isLegacyAddressed) {
+                            Serial.printf("TX1: RX type=0x%02X legacy to=0x%02X from=0x%02X payloadLen=%u\n",
+                                frameType, buf[2], buf[3], payloadLen);
+                        } else {
+                            Serial.printf("TX1: RX type=0x%02X std payloadLen=%u\n", frameType, payloadLen);
+                        }
+                    }
                     _lastResponseTime = millis();
                     _connected = true;
 
                     // Прозрачная двусторонняя ретрансляция: телеметрия TX -> RX
-                    if (crcOk) {
+                    if ((crcOk || TX_SKIP_CRC_CHECK) && isDroneTelemetryFrameType(frameType)) {
                         forwardFrameToReceiverByType(frameType, payloadPtr, payloadLen);
                         txFramesForwarded++;
+                        txTypeForwarded[frameType]++;
+                        if (isCopterTelemetryEvidenceType(frameType) ||
+                            hasCopterAirLinkByLinkStats(frameType, payloadPtr, payloadLen)) {
+                            lastCopterTelemetryMs = millis();
+                        }
                     }
 
                     switch(frameType) {
                         case CRSF_FRAMETYPE_DEVICE_INFO: 
                             Serial.println("TX1: Got DEVICE_INFO");
-                            _handleDeviceInfo(payloadPtr, payloadLen); 
+                            _handleDeviceInfo(payloadPtr, payloadLen);
+                            if (!_fieldsRequested) {
+                                Serial.println("TX1: Requesting all fields (after DEVICE_INFO)...");
+                                _requestAllFields();
+                            }
                             break;
                         case CRSF_FRAMETYPE_PARAMETER_DATA: 
-                            _handleParameterData(payloadPtr, payloadLen); 
+                            _handleParameterData(payloadPtr, payloadLen);
+                            Serial.printf("TX1: Got PARAM_DATA len=%u, fields=%u\n", payloadLen, (unsigned)_fields.size());
                             break;
                         case CRSF_FRAMETYPE_ELRS_STATUS: 
                             _handleElrsStatus(payloadPtr, payloadLen); 
@@ -921,38 +1283,67 @@ void TransmitterController::_processIncoming() {
 }
 
 void TransmitterController::_handleDeviceInfo(uint8_t* data, uint8_t len) {
-    if (len >= 3) {
-        _deviceName = String((char*)(data+3));
-        _deviceInfoReceived = true;
+    if (!_deviceInfoReceived) {
         _fields.clear();
         _fieldsRequested = false;
-        Serial.println("Device info received: " + _deviceName);
     }
+    _deviceInfoReceived = true;
+
+    // Some modules return short device-info payloads; keep flow alive anyway.
+    if (len >= 4) {
+        _deviceName = String((char*)(data + 3));
+    } else if (_deviceName.length() == 0) {
+        _deviceName = "ELRS TX";
+    }
+    Serial.printf("Device info received: %s (len=%u)\n", _deviceName.c_str(), len);
 }
 
 void TransmitterController::_handleParameterData(uint8_t* data, uint8_t len) {
     if (len < 6) return;
     uint8_t fieldId = data[2];
     uint8_t fieldType = data[4];
+
+    // CRSF Parameter Data layout:
+    // [dst][src][fieldId][parentId][fieldType][name\0][type-specific...]
+    size_t nameStart = 5;
+    size_t nameEnd = nameStart;
+    while (nameEnd < len && data[nameEnd] != 0x00) nameEnd++;
+    if (nameEnd >= len) return;  // malformed (name without '\0')
+
     CRSFField f;
     f.fieldId = fieldId;
     f.fieldType = fieldType;
     f.isFolder = false;
     f.isCommand = false;
+    f.name = String((char*)(data + nameStart));
+
+    size_t p = nameEnd + 1;
     switch(fieldType) {
-        case 0x00: case 0x01:
-            f.name = String((char*)(data+5));
-            { int semi = f.name.indexOf(';');
-              if(semi>0){ f.value = f.name.substring(semi+1); f.name = f.name.substring(0,semi); }
-              else f.value = f.name; }
+        case 0x00:  // UINT8
+        case 0x01:  // INT8
+            if (p < len) f.value = String(data[p]);
             break;
-        case 0x02: if(len>=6) f.value = String(data[5]); break;
-        case 0x03: if(len>=7) f.value = String(data[5] | (data[6]<<8)); break;
-        case 0x07: if(len>=6) { f.value = String(data[5]); if(len>6) f.options = String((char*)(data+6)); } break;
-        case 0x08: f.value = String((char*)(data+5)); break;
-        case 0x09: f.isFolder = true; f.name = String((char*)(data+5)); break;
-        case 0x0A: f.isCommand = true; f.name = String((char*)(data+5)); break;
-        default: return;
+        case 0x02:  // UINT16
+        case 0x03:  // INT16
+            if (p + 1 < len) f.value = String(data[p] | (data[p + 1] << 8));
+            break;
+        case 0x07:  // SELECT
+            if (p < len) {
+                f.value = String(data[p]);
+                if (p + 1 < len) f.options = String((char*)(data + p + 1));
+            }
+            break;
+        case 0x08:  // STRING
+            if (p < len) f.value = String((char*)(data + p));
+            break;
+        case 0x09:  // FOLDER
+            f.isFolder = true;
+            break;
+        case 0x0A:  // COMMAND
+            f.isCommand = true;
+            break;
+        default:
+            return;
     }
     _fields[fieldId] = f;
 }
@@ -998,6 +1389,89 @@ int TransmitterController::getTxPower() const {
     for (auto& p : _fields)
         if (p.second.name.indexOf("Power") >= 0) return p.second.value.toInt();
     return 0;
+}
+
+int TransmitterController::_findFieldIdByKeys(const std::vector<String>& keys) const {
+    for (const auto& p : _fields) {
+        String n = p.second.name;
+        n.toLowerCase();
+        for (const auto& key : keys) {
+            String k = key;
+            k.toLowerCase();
+            if (n.indexOf(k) >= 0) return p.first;
+        }
+    }
+    return -1;
+}
+
+String TransmitterController::_getFieldValueByKeys(const std::vector<String>& keys) const {
+    int id = _findFieldIdByKeys(keys);
+    if (id < 0) return "---";
+    auto it = _fields.find((uint8_t)id);
+    if (it == _fields.end()) return "---";
+    return it->second.value.length() ? it->second.value : "---";
+}
+
+bool TransmitterController::_setFieldByKeys(const std::vector<String>& keys, const String& value, String& shadow) {
+    int id = _findFieldIdByKeys(keys);
+    if (id < 0) return false;
+    auto it = _fields.find((uint8_t)id);
+    if (it == _fields.end()) return false;
+
+    String v = value;
+    // For SELECT fields allow passing readable option labels from docs/UI.
+    if (it->second.fieldType == 0x07) {
+        bool isNumeric = v.length() > 0;
+        for (size_t i = 0; i < v.length(); i++) {
+            if (v[i] < '0' || v[i] > '9') { isNumeric = false; break; }
+        }
+        if (!isNumeric) {
+            String opts = it->second.options;
+            int start = 0;
+            int idx = 0;
+            String needle = v;
+            needle.toLowerCase();
+            while (start <= opts.length()) {
+                int sep = opts.indexOf(';', start);
+                if (sep < 0) sep = opts.length();
+                String opt = opts.substring(start, sep);
+                String cmp = opt;
+                cmp.toLowerCase();
+                if (cmp == needle) {
+                    v = String(idx);
+                    break;
+                }
+                idx++;
+                start = sep + 1;
+            }
+        }
+    }
+
+    if (!setValue(id, v)) return false;
+    shadow = value;
+    return true;
+}
+
+String TransmitterController::getTxPowerRead() const { return _getFieldValueByKeys({"power"}); }
+String TransmitterController::getRfModeRead() const { return _getFieldValueByKeys({"rfmd", "rf mode"}); }
+String TransmitterController::getSwitchModeRead() const { return _getFieldValueByKeys({"switch mode"}); }
+String TransmitterController::getAntennaModeRead() const { return _getFieldValueByKeys({"antenna mode", "ant mode"}); }
+String TransmitterController::getTelemRatioRead() const { return _getFieldValueByKeys({"telem ratio", "telemetry ratio"}); }
+
+bool TransmitterController::setTxPowerByName(const String& value) {
+    return _setFieldByKeys({"power"}, value, _txPowerSet);
+}
+bool TransmitterController::setRfModeByName(const String& value) {
+    return _setFieldByKeys({"rfmd", "rf mode"}, value, _rfModeSet);
+}
+bool TransmitterController::setSwitchModeByName(const String& value) {
+    return _setFieldByKeys({"switch mode"}, value, _switchModeSet);
+}
+bool TransmitterController::setAntennaModeByName(const String& value) {
+    return _setFieldByKeys({"antenna mode", "ant mode"}, value, _antennaModeSet);
+}
+bool TransmitterController::setTelemRatioByName(const String& value) {
+    return _setFieldByKeys({"telem ratio", "telemetry ratio"}, value, _telemRatioSet);
 }
 
 int TransmitterController::getPktRate() const {
